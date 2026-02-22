@@ -230,6 +230,8 @@ section[data-testid="stSidebar"],
     overflow-y: auto;
     margin-bottom: 1.2rem;
     backdrop-filter: blur(12px);
+    display: flex;
+    flex-direction: column-reverse;
 }
 .terminal-block .err { color: #f85149; }
 .terminal-block .warn { color: #d29922; }
@@ -334,8 +336,9 @@ def detect_gpu() -> dict:
 def init_state():
     defaults = {
         "page": "Upload",
-        "results": [], "box": None, "rec_path": None,
+        "results": [], "boxes": [], "rec_path": None,
         "work_dir": None, "rec_bytes": None, "lig_files_data": [],
+        "multi_pocket": False, "cancel_run": False,
         # RDKit
         "embed_method": "ETKDGv3", "max_attempts": 250,
         "force_field": "MMFF94", "ff_steps": 500,
@@ -347,6 +350,7 @@ def init_state():
         # GNINA
         "exhaustiveness": 16, "num_poses": 9, "cnn_model": "default",
         "cnn_weight": 1.0, "min_rmsd": 1.0, "gnina_seed": 0, "gpu_device": "auto",
+        "flexdist": False, "cnn_mode": "none",
         # Vina
         "v_exhaustiveness": 8, "v_num_poses": 9,
         "energy_range": 3, "scoring_fn": "vina", "vina_seed": 0,
@@ -417,7 +421,7 @@ def render_stepper():
     order   = [s[0] for s in STEPS]
     cur_idx = order.index(st.session_state.page) if st.session_state.page in order else 0
     done    = {"Upload":   st.session_state.rec_bytes is not None and bool(st.session_state.lig_files_data),
-               "Settings": st.session_state.box is not None,
+               "Settings": bool(st.session_state.boxes),
                "Run":      bool(st.session_state.results),
                "Help":     False}
 
@@ -597,7 +601,7 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
     res = {"name":name,"cnn_score":None,"cnn_affinity":None,"vina_score":None,"status":"failed","pose_sdf":None}
     if log_lines is None: log_lines = []
     
-    def update_term(new_line=""):
+    def update_term(new_line="", temp_line=""):
         if not term_el: return
         if new_line:
             # Color coding the output
@@ -609,6 +613,11 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
         
         # Keep only last 100 lines to prevent lag
         display_lines = log_lines[-100:]
+        if temp_line:
+            display_lines = display_lines + [f"<span class='info'>{temp_line}</span>"]
+            
+        # Reverse the list so the newest line is at the bottom of the flex column-reverse
+        display_lines = display_lines[::-1]
         html = f"<div class='terminal-block'>{'<br>'.join(display_lines)}</div>"
         term_el.markdown(html, unsafe_allow_html=True)
 
@@ -629,26 +638,56 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
             gpu_flag = ["--no_gpu"] if cfg.get("gpu_device")=="cpu" else \
                        ["--device",cfg["gpu_device"]] if cfg.get("gpu_device") in ("0","1") else []
             cmd = [gnina_exe,"--receptor",receptor,"--ligand",lig_pdbqt,"--out",out_sdf,
-                   "--center_x",str(box["cx"]),"--center_y",str(box["cy"]),"--center_z",str(box["cz"]),
-                   "--size_x",str(box["sx"]),"--size_y",str(box["sy"]),"--size_z",str(box["sz"]),
+                   "--center_x",f"{box['cx']:.3f}","--center_y",f"{box['cy']:.3f}","--center_z",f"{box['cz']:.3f}",
+                   "--size_x",f"{box['sx']:.3f}","--size_y",f"{box['sy']:.3f}","--size_z",f"{box['sz']:.3f}",
                    "--exhaustiveness",str(cfg.get("exhaustiveness",16)),
                    "--num_modes",str(cfg.get("num_poses",9)),
                    "--min_rmsd_filter",str(cfg.get("min_rmsd",1.0)),
-                   "--cnn_scoring","rescore"] + gpu_flag
+                   "--cnn_scoring",cfg.get("cnn_mode", "rescore")] + gpu_flag
             
             cnn = cfg.get("cnn_model","default")
             if cnn != "default": cmd += ["--cnn",cnn]
             if cfg.get("gnina_seed",0): cmd += ["--seed",str(cfg["gnina_seed"])]
+            if cfg.get("flexdist", False): 
+                cmd += ["--flexdist", "3.5", "--flexdist_ligand", lig_pdbqt]
             
             update_term(f"> Executing: {' '.join(cmd)}")
             
             try:
+                import time
+                import threading
+                import queue
+                
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
                 full_log = []
-                for line in proc.stdout:
-                    full_log.append(line)
-                    update_term(line)
-                proc.wait()
+                q = queue.Queue()
+                
+                def enqueue_output(out, queue):
+                    for line in iter(out.readline, ''):
+                        if not line: break
+                        queue.put(line)
+                    out.close()
+                    
+                t = threading.Thread(target=enqueue_output, args=(proc.stdout, q))
+                t.daemon = True
+                t.start()
+                
+                start_time = time.time()
+                while True:
+                    if st.session_state.get("cancel_run", False):
+                        proc.terminate()
+                        break
+                        
+                    try:
+                        line = q.get(timeout=0.1)
+                        full_log.append(line)
+                        update_term(new_line=line)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            break
+                        elapsed = int(time.time() - start_time)
+                        update_term(temp_line=f"⚙️ GNINA is computing flexible docking ({elapsed}s elapsed)...")
+                        
                 log = "".join(full_log)
             except FileNotFoundError:
                 err = "error: GNINA executable not found on system path — use AutoDock Vina"
@@ -661,10 +700,27 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
                 cmd = [c for c in cmd if c not in ("--device", "0", "1")] + ["--no_gpu"]
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
                 full_log = []
-                for line in proc.stdout:
-                    full_log.append(line)
-                    update_term(line)
-                proc.wait()
+                q2 = queue.Queue()
+                t2 = threading.Thread(target=enqueue_output, args=(proc.stdout, q2))
+                t2.daemon = True
+                t2.start()
+                
+                start_time = time.time()
+                while True:
+                    if st.session_state.get("cancel_run", False):
+                        proc.terminate()
+                        break
+                        
+                    try:
+                        line = q2.get(timeout=0.1)
+                        full_log.append(line)
+                        update_term(new_line=line)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            break
+                        elapsed = int(time.time() - start_time)
+                        update_term(temp_line=f"⚙️ GNINA CPU Fallback is computing flexible docking ({elapsed}s elapsed)...")
+                        
                 log = "".join(full_log)
 
             # GNINA is known to throw non-zero exit codes (like OpenBabel) if it encounters 
@@ -711,39 +767,51 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
     return res
 
 
-def batch_dock(rec_items, lig_items, box, cfg, out_dir, prog, status_el):
+def batch_dock(rec_items, lig_items, boxes, cfg, out_dir, prog, status_el):
     n, backend = cfg.get("n_jobs",1), cfg.get("backend","loky")
     tasks = []
     for rname, rpdbqt, rpdb in rec_items:
         for lname, lpdbqt in lig_items:
-            tasks.append((rname, rpdbqt, rpdb, lname, lpdbqt))
+            for box in boxes:
+                tasks.append((rname, rpdbqt, rpdb, lname, lpdbqt, box))
             
     results = []
+    st.session_state.cancel_run = False
     
     # Create the terminal element in the UI
-    term_el = None
+    term_el = st.empty()
     shared_log = []
     
     if n == 1 or len(tasks) == 1:
-        for i, (rn, rp, rpdb, ln, lp) in enumerate(tasks):
-            status_el.caption(f"Docking {ln} into {rn} ({i+1}/{len(tasks)})…")
-            res = run_single(lp, rp, box, cfg, out_dir, f"r_{rn}_l_{ln}", term_el, shared_log)
+        for i, (rn, rp, rpdb, ln, lp, bx) in enumerate(tasks):
+            if st.session_state.get("cancel_run", False): 
+                status_el.warning("Run cancelled by user.")
+                break
+                
+            status_el.caption(f"Docking **{ln}** into **{rn}** [{bx['name']}] ({i+1}/{len(tasks)})…")
+            res = run_single(lp, rp, bx, cfg, out_dir, f"r_{rn}_l_{ln}_{bx['name'].replace(' ', '')}", term_el, shared_log)
             res["Ligand"] = ln
             res["Receptor"] = rn
+            res["Pocket"] = bx['name']
             res["rec_pdb"] = rpdb
             results.append(res)
             prog.progress((i+1)/len(tasks))
     else:
-        status_el.caption(f"Running {len(tasks)} docking pairs on {n} cores…")
-        def run_pair(rn, rp, rpdb, ln, lp):
-            r = run_single(lp, rp, box, cfg, out_dir, f"r_{rn}_l_{ln}", None, None) # Nullify terminal during multiproc
-            r["Ligand"] = ln
-            r["Receptor"] = rn
-            r["rec_pdb"] = rpdb
-            return r
-        results = Parallel(n_jobs=n, backend=backend)(
-            delayed(run_pair)(rn, rp, rpdb, ln, lp) for rn, rp, rpdb, ln, lp in tasks)
-        prog.progress(1.0)
+        status_el.caption(f"Running {len(tasks)} docking pairs sequentially because threaded execution blocked Streamlit...")
+        for i, (rn, rp, rpdb, ln, lp, bx) in enumerate(tasks):
+            if st.session_state.get("cancel_run", False): 
+                status_el.warning("Run cancelled by user.")
+                break
+                
+            status_el.caption(f"Docking **{ln}** into **{rn}** [{bx['name']}] ({i+1}/{len(tasks)})…")
+            res = run_single(lp, rp, bx, cfg, out_dir, f"r_{rn}_l_{ln}_{bx['name'].replace(' ', '')}", term_el, shared_log)
+            res["Ligand"] = ln
+            res["Receptor"] = rn
+            res["Pocket"] = bx['name']
+            res["rec_pdb"] = rpdb
+            results.append(res)
+            prog.progress((i+1)/len(tasks))
+            
     return results
 
 
@@ -819,7 +887,7 @@ def render_3d(rec_pdb, pose_sdf, view_style="Cartoon"):
     except Exception as e:
         st.error(f"Viewer error: {e}")
 
-def render_box_preview(rec_bytes, box):
+def render_box_preview(rec_bytes, boxes):
     try:
         import py3Dmol
         from stmol import showmol
@@ -828,18 +896,19 @@ def render_box_preview(rec_bytes, box):
         view.addModel(rec_bytes.decode("utf-8", errors="ignore"), "pdb")
         view.setStyle({"model":0},{"cartoon":{"color":"spectrum"}})
         
-        bspec = {
-            "center": {"x": box["cx"], "y": box["cy"], "z": box["cz"]},
-            "dimensions": {"w": box["sx"], "h": box["sy"], "d": box["sz"]},
-            "color": "#00c6ff",
-            "opacity": 0.5,
-            "wireframe": True
-        }
-        view.addBox(bspec)
-        bsolid = bspec.copy()
-        bsolid["wireframe"] = False
-        bsolid["opacity"] = 0.15
-        view.addBox(bsolid)
+        for box in boxes:
+            bspec = {
+                "center": {"x": box["cx"], "y": box["cy"], "z": box["cz"]},
+                "dimensions": {"w": box["sx"], "h": box["sy"], "d": box["sz"]},
+                "color": "#00c6ff",
+                "opacity": 0.5,
+                "wireframe": True
+            }
+            view.addBox(bspec)
+            bsolid = bspec.copy()
+            bsolid["wireframe"] = False
+            bsolid["opacity"] = 0.15
+            view.addBox(bsolid)
         
         view.zoomTo()
         view.setBackgroundColor("#0c0f1d")
@@ -916,7 +985,7 @@ def page_upload():
     st.markdown("**Docking Box**")
     st.caption("The box defines the 3D search space for docking. Click below to calculate it automatically from your receptor, or set it manually in Settings.")
 
-    col_btn, col_pbtn, col_pad = st.columns([1,1,2])
+    col_btn, col_pbtn, col_multi, col_pad = st.columns([1,1,1,1])
     with col_btn:
         if st.button("Compute Autobox", use_container_width=True):
             if not getattr(st.session_state, "rec_files_data", None):
@@ -930,11 +999,16 @@ def page_upload():
                         rfp = os.path.join(td,"ref.sdf")
                         Path(rfp).write_bytes(ref_file.read())
                     try:
-                        st.session_state.box = compute_autobox(rp, rfp, st.session_state.box_padding)
+                        box = compute_autobox(rp, rfp, st.session_state.box_padding)
+                        box["name"] = "Autobox"
+                        st.session_state.boxes = [box]
                         st.rerun()
                     except Exception as e:
                         st.error(f"Autoboxing failed: {e}")
                         
+    with col_multi:
+        st.session_state.multi_pocket = st.toggle("Multi-Pocket (Top 5)", value=st.session_state.get("multi_pocket", False))
+
     with col_pbtn:
         if st.button("Suggest Pocket (fpocket)", use_container_width=True, help="Automatically detects the best binding cavity"):
             if not getattr(st.session_state, "rec_files_data", None):
@@ -946,40 +1020,50 @@ def page_upload():
                     Path(rp).write_bytes(st.session_state.rec_files_data[0][1])
                     try:
                         subprocess.run(["fpocket", "-f", rp], cwd=td, capture_output=True, check=True)
-                        p_file = Path(td) / "rec_out" / "pockets" / "pocket1_atm.pdb"
-                        if p_file.exists():
-                            st.session_state.box = compute_autobox(str(p_file), None, st.session_state.box_padding)
+                        found_boxes = []
+                        max_pockets = 5 if st.session_state.multi_pocket else 1
+                        
+                        for i in range(1, max_pockets + 1):
+                            p_file = Path(td) / "rec_out" / "pockets" / f"pocket{i}_atm.pdb"
+                            if p_file.exists():
+                                bx = compute_autobox(str(p_file), None, st.session_state.box_padding)
+                                bx["name"] = f"Pocket {i}"
+                                found_boxes.append(bx)
+                                
+                        if found_boxes:
+                            st.session_state.boxes = found_boxes
                             st.rerun()
                         else:
                             st.error("No pockets detected by fpocket.")
                     except Exception as e:
                         st.error(f"fpocket failed: {e}. Is it installed via setup.sh?")
 
-    if st.session_state.box:
-        b = st.session_state.box
-        st.markdown(
-            '<div class="box-grid">'
-            + "".join(f'<div class="box-cell"><div class="box-val">{b[k]:.1f}</div>'
-                       f'<div class="box-lbl">{l}</div></div>'
-                       for k,l in [("cx","Center X"),("cy","Center Y"),("cz","Center Z"),
-                                   ("sx","Size X"),("sy","Size Y"),("sz","Size Z")])
-            + "</div>",
-            unsafe_allow_html=True
-        )
+    if st.session_state.boxes:
+        for b in st.session_state.boxes:
+            st.markdown(f"**{b['name']}**")
+            st.markdown(
+                '<div class="box-grid" style="margin-bottom: 1rem;">'
+                + "".join(f'<div class="box-cell"><div class="box-val">{b[k]:.1f}</div>'
+                           f'<div class="box-lbl">{l}</div></div>'
+                           for k,l in [("cx","Center X"),("cy","Center Y"),("cz","Center Z"),
+                                       ("sx","Size X"),("sy","Size Y"),("sz","Size Z")])
+                + "</div>",
+                unsafe_allow_html=True
+            )
         
         if getattr(st.session_state, "rec_files_data", None):
             st.markdown("<br>**3D Docking Box Preview**", unsafe_allow_html=True)
-            render_box_preview(st.session_state.rec_files_data[0][1], st.session_state.box)
+            render_box_preview(st.session_state.rec_files_data[0][1], st.session_state.boxes)
 
     st.divider()
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Receptor",  "Ready" if st.session_state.rec_bytes else "Missing")
     c2.metric("Ligands",   len(st.session_state.lig_files_data) or "Missing")
-    c3.metric("Box",       "Ready" if st.session_state.box else "Not set")
+    c3.metric("Box",       f"{len(st.session_state.boxes)} ready" if st.session_state.boxes else "Not set")
     c4.metric("Engine",    st.session_state.engine)
 
     st.markdown("")
-    if st.session_state.rec_bytes and st.session_state.lig_files_data and st.session_state.box:
+    if st.session_state.rec_bytes and st.session_state.lig_files_data and st.session_state.boxes:
         if st.button("Next: Settings →", use_container_width=False):
             st.session_state.page = "Settings"; st.rerun()
 
@@ -1122,6 +1206,10 @@ def page_settings():
                 "CNN model", ["default","dense","crossdocked_default2018"],
                 index=["default","dense","crossdocked_default2018"].index(st.session_state.cnn_model),
                 help="Neural network model for CNN scoring.")
+            st.session_state.cnn_mode = st.selectbox(
+                "CNN Mode", ["none", "rescore", "refinement", "all"],
+                index=["none", "rescore", "refinement", "all"].index(st.session_state.cnn_mode),
+                help="none: skip AI scoring. rescore: fast Vina search then AI grading. refinement: AI guides the physical energy minimization (10x slower but higher quality).")
             st.session_state.cnn_weight = st.slider(
                 "CNN scoring weight", 0.0, 1.0, st.session_state.cnn_weight, 0.05,
                 help="1.0 = pure CNN, 0.0 = pure Vina score for pose ranking.")
@@ -1131,6 +1219,9 @@ def page_settings():
             st.session_state.gpu_device = st.selectbox(
                 "GPU device", ["auto","0","1","cpu"],
                 index=["auto","0","1","cpu"].index(st.session_state.gpu_device))
+            st.session_state.flexdist = st.toggle(
+                "Flexible Docking (Induced Fit)", st.session_state.flexdist,
+                help="Automatically allows receptor side-chains within 3.5 Å of the pocket center to move, simulating biological induced fit.")
                 
             if st.checkbox("ℹ️ Learn more about GNINA parameters"):
                 st.info("""
@@ -1147,16 +1238,18 @@ def page_settings():
         st.session_state.box_padding = st.slider(
             "Autobox padding (A)", 1, 20, st.session_state.box_padding,
             help="Extra space (in Angstroms) added around the receptor or reference ligand when computing the box.")
-        manual = st.toggle("Manual box override", False)
+        manual = st.toggle("Manual box override (Pocket 1)", False)
         if manual:
             cc, cs = st.columns(2)
-            cx = cc.number_input("Center X", value=st.session_state.box["cx"] if st.session_state.box else 0.0)
-            cy = cc.number_input("Center Y", value=st.session_state.box["cy"] if st.session_state.box else 0.0)
-            cz = cc.number_input("Center Z", value=st.session_state.box["cz"] if st.session_state.box else 0.0)
-            sx = cs.number_input("Size X", value=st.session_state.box["sx"] if st.session_state.box else 20.0)
-            sy = cs.number_input("Size Y", value=st.session_state.box["sy"] if st.session_state.box else 20.0)
-            sz = cs.number_input("Size Z", value=st.session_state.box["sz"] if st.session_state.box else 20.0)
-            st.session_state.box = {"cx":cx,"cy":cy,"cz":cz,"sx":sx,"sy":sy,"sz":sz}
+            cbox = st.session_state.boxes[0] if st.session_state.boxes else None
+            cx = cc.number_input("Center X", value=cbox["cx"] if cbox else 0.0)
+            cy = cc.number_input("Center Y", value=cbox["cy"] if cbox else 0.0)
+            cz = cc.number_input("Center Z", value=cbox["cz"] if cbox else 0.0)
+            sx = cs.number_input("Size X", value=cbox["sx"] if cbox else 20.0)
+            sy = cs.number_input("Size Y", value=cbox["sy"] if cbox else 20.0)
+            sz = cs.number_input("Size Z", value=cbox["sz"] if cbox else 20.0)
+            # Override all boxes with just 1 manual box
+            st.session_state.boxes = [{"name": "Manual", "cx":cx,"cy":cy,"cz":cz,"sx":sx,"sy":sy,"sz":sz}]
 
         st.markdown('<hr style="border:none;border-top:1px solid #1e2530;margin:1.5rem 0 1rem">', unsafe_allow_html=True)
         st.markdown("**Parallelization**")
@@ -1193,8 +1286,8 @@ def build_pdf_report(df, engine):
     pdf.set_text_color(30,30,30)
     
     # Table Header
-    col_w = [40, 80, 35, 35]
-    headers = ["Receptor", "Ligand", "Vina Score", "CNN Score" if engine=="GNINA" else "Status"]
+    col_w = [25, 60, 25, 25, 30]
+    headers = ["Receptor", "Ligand", "Pocket", "Vina Score", "CNN Score" if engine=="GNINA" else "Status"]
     for i, h in enumerate(headers):
         pdf.cell(col_w[i], 10, h, border=1, align="C")
     pdf.ln()
@@ -1208,15 +1301,16 @@ def build_pdf_report(df, engine):
         df_top = df_top.sort_values(sort_col, ascending=ascend).head(50)
         
         for _, row in df_top.iterrows():
-            pdf.cell(col_w[0], 8, str(row["Receptor"])[:20], border=1)
-            pdf.cell(col_w[1], 8, str(row["Ligand"])[:45], border=1)
-            pdf.cell(col_w[2], 8, f"{row['Vina Score']:.2f}" if pd.notna(row['Vina Score']) else "-", border=1, align="C")
+            pdf.cell(col_w[0], 8, str(row["Receptor"])[:12], border=1)
+            pdf.cell(col_w[1], 8, str(row["Ligand"])[:30], border=1)
+            pdf.cell(col_w[2], 8, str(row.get("Pocket", ""))[:12], border=1)
+            pdf.cell(col_w[3], 8, f"{row['Vina Score']:.2f}" if pd.notna(row['Vina Score']) else "-", border=1, align="C")
             
             if engine == "GNINA":
                 v3 = f"{row['CNN Score']:.3f}" if pd.notna(row['CNN Score']) else "-"
             else:
                 v3 = str(row["Status"])
-            pdf.cell(col_w[3], 8, v3, border=1, align="C")
+            pdf.cell(col_w[4], 8, v3, border=1, align="C")
             pdf.ln()
             
     return bytes(pdf.output())
@@ -1295,7 +1389,7 @@ def page_run():
 
     ready = (getattr(st.session_state, "rec_files_data", None)
              and st.session_state.lig_files_data
-             and st.session_state.box is not None)
+             and st.session_state.boxes)
 
     if not ready:
         st.warning("Complete the **Upload** page first — receptor, ligands, and box must all be set.")
@@ -1305,16 +1399,18 @@ def page_run():
     cfg = {k: st.session_state[k] for k in [
         "engine","embed_method","max_attempts","force_field","ff_steps", "target_ph",
         "add_hs","keep_chirality","merge_nphs","hydrate",
-        "exhaustiveness","num_poses","cnn_model","cnn_weight","min_rmsd","gnina_seed","gpu_device",
+        "exhaustiveness","num_poses","cnn_model","cnn_weight","min_rmsd","gnina_seed","gpu_device", "flexdist", "cnn_mode",
         "v_exhaustiveness","v_num_poses","energy_range","scoring_fn","vina_seed",
         "n_jobs","backend"
     ]}
 
-    c1, c2, c3 = st.columns([2,2,1])
+    c1, c2, c3, c4 = st.columns([1.5,1.5,1,1])
     c1.metric("Engine", cfg["engine"])
     c2.metric("Ligand files", len(st.session_state.lig_files_data))
     with c3:
-        go = st.button("Run Docking", use_container_width=True)
+        go = st.button("Run Docking", use_container_width=True, type="primary")
+    with c4:
+        st.button("Stop / Cancel", use_container_width=True, on_click=lambda: st.session_state.update(cancel_run=True))
 
     if go:
         work_dir = tempfile.mkdtemp(prefix="stratadock_")
@@ -1370,7 +1466,7 @@ def page_run():
         if not lig_items: st.error("No ligands prepared."); st.stop()
 
         prog2, stat2 = st.progress(0.0), st.empty()
-        results = batch_dock(rec_items, lig_items, st.session_state.box, cfg, work_dir, prog2, stat2)
+        results = batch_dock(rec_items, lig_items, st.session_state.boxes, cfg, work_dir, prog2, stat2)
         st.session_state.results = results
         ok = sum(1 for r in results if r["status"]=="success")
         stat2.success(f"Done — {ok}/{len(results)} ligands docked successfully")
@@ -1385,8 +1481,12 @@ def page_run():
         data_rows = []
         for r in res:
             row = {
-                "Receptor": r["Receptor"], "Ligand": r["Ligand"], "Vina Score": r.get("vina_score"),
-                "CNN Score": r.get("cnn_score"), "CNN Affinity": r.get("cnn_affinity"),
+                "Receptor": r["Receptor"], 
+                "Ligand": r["Ligand"], 
+                "Pocket": r.get("Pocket", "Autobox"), 
+                "Vina Forcefield (kcal/mol)": r.get("vina_score"),
+                "CNN Pose Probability (0-1)": r.get("cnn_score"), 
+                "CNN Affinity (pKd)": r.get("cnn_affinity"),
                 "Status": r.get("status")
             }
             if r["Ligand"] in admet_data:
@@ -1447,7 +1547,7 @@ def page_run():
 
         with res_tab1:
             # Show only Docking columns
-            dock_cols = [c for c in ["Receptor", "Ligand", "Vina Score", "CNN Score", "CNN Affinity", "Status"] if c in sorted_df.columns]
+            dock_cols = [c for c in ["Receptor", "Ligand", "Pocket", "Vina Score", "CNN Score", "CNN Affinity", "Status"] if c in sorted_df.columns]
             dock_df = sorted_df[dock_cols]
             st.dataframe(
                 dock_df.style.format({"Vina Score":"{:.3f}","CNN Score":"{:.4f}","CNN Affinity":"{:.3f}"},na_rep="—"),
@@ -1555,10 +1655,10 @@ def page_help():
         st.caption("Save your progress, uploaded proteins, and tuning settings to a file, or resume a previous docking project.")
         
         export_keys = [
-            "engine", "box", "rec_files_data", "lig_files_data", "box_padding", 
+            "engine", "boxes", "rec_files_data", "lig_files_data", "box_padding", "multi_pocket",
             "embed_method", "max_attempts", "force_field", "ff_steps", "add_hs", 
             "keep_chirality", "merge_nphs", "hydrate", "exhaustiveness", "num_poses", 
-            "cnn_model", "cnn_weight", "min_rmsd", "gnina_seed", "gpu_device", 
+            "cnn_model", "cnn_weight", "min_rmsd", "gnina_seed", "gpu_device", "flexdist", "cnn_mode",
             "v_exhaustiveness", "v_num_poses", "energy_range", "scoring_fn", "vina_seed", 
             "n_jobs", "backend"
         ]
