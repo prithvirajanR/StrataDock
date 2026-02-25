@@ -1,0 +1,130 @@
+==================================================
+  STRATADOCK — AI-Powered Drug Discovery Suite
+==================================================
+
+What is StrataDock?
+-------------------
+StrataDock is a software tool I built for molecular
+docking — the computational process of predicting how
+a drug molecule physically binds to a target protein.
+
+Instead of writing complex command-line scripts,
+StrataDock wraps everything into a clean, interactive
+web application that runs on your local machine.
+
+It's designed to automate an entire drug screening
+pipeline: from uploading raw protein & drug files,
+to generating 3D molecular structures, running
+AI-guided docking simulations, and producing a
+results table with ranked hits and downloadable reports.
+
+
+What problem does it solve?
+---------------------------
+Traditional molecular docking pipelines require
+separate software tools, manual command-line steps,
+complex file format conversions, and a lot of
+computational chemistry expertise.
+
+StrataDock automates the entire chain end-to-end,
+making it accessible to researchers and students who
+want results without spending days configuring software.
+
+
+Key Technologies Used
+---------------------
+- GNINA: The primary docking engine. It uses a
+  Convolutional Neural Network (similar to the kind
+  used in image recognition) trained on thousands of
+  real protein-drug crystal structures from the Protein
+  Data Bank (PDB). It scores how well a drug fits
+  a protein pocket like a trained expert.
+
+- AutoDock Vina: The industry-standard physics-based
+  docking engine. Used as a fast, reliable fallback.
+
+- RDKit: Cheminformatics library. Converts 1D chemical
+  text strings (SMILES) into full 3D molecular models
+  with correct geometry and bonds.
+
+- fpocket: Automatically analyzes a protein's surface
+  and identifies the top 5 most likely drug-binding
+  cavities on the protein's surface.
+
+- OpenBabel: Adjusts the proton count on drug molecules
+  to match physiological conditions (pH 7.4) before
+  docking, for more biologically accurate results.
+
+
+What it can do
+--------------
+- Upload protein files (.pdb) and drug files (.smi)
+- Automatically generate 3D structures for drugs
+- Detect the top 5 binding pockets on a protein
+- Dock every drug against every protein & pocket
+  simultaneously using parallelized multi-threading
+- Use a deep learning AI (GNINA) to score and rank
+  the best binding poses
+- Run flexible docking where the protein's amino acid
+  side chains actually move to accommodate the drug
+  (simulating "induced fit" biology)
+- Display results in a color-coded table:
+    Green = Strong binding (very negative Vina score)
+    Red   = Weak binding (less negative Vina score)
+- Calculate drug-likeness (ADMET) statistics using
+  RDKit: Lipinski's Rule of Five, LogP, QED score
+- View the actual 3D binding pose in the browser
+- Export a full ZIP archive containing all scores,
+  a PDF report, the raw output files, and a PyMOL
+  visualization script
+- Save and reload the entire session state so you
+  never have to re-run calculations from scratch
+
+
+How to interpret the scores
+---------------------------
+Vina Score (kcal/mol):
+  The estimated binding free energy.
+  More negative = stronger binding = better candidate.
+  Typically: below -8 is considered good.
+              below -10 is excellent.
+
+CNN Pose Probability (0-1):
+  AI confidence score. How sure the neural network is
+  that the predicted binding pose looks like a real
+  biological interaction from actual crystal data.
+  Higher = more trustworthy pose.
+
+CNN Affinity (pKd):
+  AI-predicted potency.
+  pKd of 9 = nanomolar affinity = very potent drug.
+  pKd = -log10(dissociation constant Kd)
+
+QED Score (0-1):
+  Quantitative Estimate of Drug-likeness.
+  A composite score combining 8 drug-likeness
+  properties. Above 0.7 is considered excellent.
+
+
+How to run it (technical)
+--------------------------
+1. Works on Linux or Windows (via WSL2)
+2. Run: bash setup.sh   (installs everything once)
+3. Run: ./run.sh        (launches the app)
+4. Open browser at: http://localhost:8501
+
+
+Stack summary
+-------------
+Language:    Python
+UI:          Streamlit (browser-based)
+Engines:     GNINA, AutoDock Vina
+Chemistry:   RDKit, Meeko, OpenBabel, fpocket
+3D Viewer:   py3Dmol
+Parallelism: joblib (CPU multi-threading)
+Reports:     fpdf2 (PDF), pandas (CSV)
+
+
+--------------------------------------------------
+  Built by Prithvi Rajan | StrataDock Project
+--------------------------------------------------
