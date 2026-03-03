@@ -7,7 +7,7 @@ conda activate stratadock
 # Export the Conda environment library path so GNINA can find libcudnn.so.9
 export LD_LIBRARY_PATH="$CONDA_BASE/envs/stratadock/lib:$LD_LIBRARY_PATH"
 
-cd "$HOME/stratadock"
+cd "$(dirname "$(realpath "$0")")"
 echo ""
 echo "  StrataDock is starting..."
 echo "  Open your browser at: http://localhost:8501"

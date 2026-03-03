@@ -487,7 +487,7 @@ def detect_gpu() -> dict:
 def init_state():
     defaults = {
         "page": "Upload",
-        "results": [], "boxes": [], "rec_path": None,
+        "results": [], "boxes": {}, "rec_path": None,
         "work_dir": None, "rec_bytes": None, "lig_files_data": [],
         "multi_pocket": False, "cancel_run": False,
         # RDKit
@@ -510,6 +510,10 @@ def init_state():
         "box_padding": 8,
         # Default target pH
         "target_ph": 7.4,
+        # Protein Preparation
+        "prep_remove_water": True, "prep_remove_het": True, "prep_keep_metals": True,
+        "prep_add_h": True, "prep_fix_atoms": True, "prep_fix_loops": True,
+        "prep_propka": False, "prep_minimize": False, "prep_min_steps": 100,
         # Parallelization
         "n_jobs": max(1, (os.cpu_count() or 4) - 1), "backend": "loky",
     }
@@ -639,6 +643,111 @@ def compute_admet(mol):
         return {"MW": None, "LogP": None, "TPSA": None, "HBD": None, "HBA": None, "QED": None, "Lipinski Fails": None}
 
 
+def analyze_interactions(rec_pdb, pose_sdf, distance_cutoff=4.0):
+    """Find receptor residues interacting with the docked ligand pose."""
+    try:
+        from Bio.PDB import PDBParser, NeighborSearch, Selection
+        # Parse receptor
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("rec", rec_pdb)
+        rec_atoms = Selection.unfold_entities(structure, "A")
+
+        # Parse ligand from SDF
+        supp = SDMolSupplier(pose_sdf, removeHs=False)
+        lig_mol = next((m for m in supp if m is not None), None)
+        if lig_mol is None:
+            return pd.DataFrame()
+
+        conf = lig_mol.GetConformer()
+        lig_coords = [conf.GetAtomPosition(i) for i in range(lig_mol.GetNumAtoms())]
+        lig_elements = [lig_mol.GetAtomWithIdx(i).GetSymbol() for i in range(lig_mol.GetNumAtoms())]
+
+        # Build NeighborSearch from receptor atoms
+        ns = NeighborSearch(rec_atoms)
+
+        POLAR = {"N", "O", "S", "F"}
+        HYDROPHOBIC = {"C"}
+        CHARGED_POS = {"ARG", "LYS", "HIS"}
+        CHARGED_NEG = {"ASP", "GLU"}
+
+        contacts = []
+        seen = set()
+        for i, (lc, le) in enumerate(zip(lig_coords, lig_elements)):
+            nearby = ns.search(np.array([lc.x, lc.y, lc.z]), distance_cutoff, "A")
+            for atom in nearby:
+                res = atom.get_parent()
+                res_key = (res.get_resname(), res.get_id()[1], res.get_full_id()[2])
+                if res_key in seen:
+                    continue
+                seen.add(res_key)
+                
+                dist = np.linalg.norm(np.array([lc.x, lc.y, lc.z]) - atom.get_vector().get_array())
+                rec_elem = atom.element.strip() if atom.element else atom.get_name()[0]
+                resname = res.get_resname()
+                
+                # Classify bond type
+                if rec_elem in POLAR and le in POLAR and dist < 3.5:
+                    bond_type = "H-bond"
+                elif rec_elem in HYDROPHOBIC and le in HYDROPHOBIC and dist < 4.0:
+                    bond_type = "Hydrophobic"
+                elif ((resname in CHARGED_POS and le in POLAR) or (resname in CHARGED_NEG and le in POLAR)) and dist < 4.0:
+                    bond_type = "Salt bridge"
+                else:
+                    bond_type = "van der Waals"
+
+                contacts.append({
+                    "Residue": resname,
+                    "Chain": res.get_full_id()[2],
+                    "ResID": res.get_id()[1],
+                    "Receptor Atom": atom.get_name(),
+                    "Distance (Å)": round(dist, 2),
+                    "Bond Type": bond_type
+                })
+
+        df = pd.DataFrame(contacts)
+        if not df.empty:
+            df = df.sort_values("Distance (Å)").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_complex_pdb(rec_pdb, pose_sdf, out_path=None):
+    """Merge receptor PDB and docked ligand SDF into a single PDB complex file."""
+    try:
+        if not Path(rec_pdb).exists() or not Path(pose_sdf).exists():
+            return None
+        if out_path is None:
+            out_path = pose_sdf.replace("_out.sdf", "_complex.pdb")
+
+        rec_lines = Path(rec_pdb).read_text().splitlines()
+        # Remove END/ENDMDL lines from receptor
+        rec_clean = [l for l in rec_lines if not l.startswith("END")]
+
+        # Convert ligand SDF to PDB HETATM records via RDKit
+        supp = SDMolSupplier(pose_sdf, removeHs=False)
+        lig_mol = next((m for m in supp if m is not None), None)
+        if lig_mol is None:
+            return None
+
+        lig_pdb = Chem.MolToPDBBlock(lig_mol)
+        # Convert ATOM to HETATM for the ligand
+        lig_lines = []
+        for l in lig_pdb.splitlines():
+            if l.startswith("ATOM"):
+                lig_lines.append("HETATM" + l[6:])
+            elif not l.startswith("END"):
+                lig_lines.append(l)
+
+        combined = "\n".join(rec_clean) + "\nTER\n" + "\n".join(lig_lines) + "\nEND\n"
+        Path(out_path).write_text(combined)
+        return out_path
+    except Exception:
+        return None
+
+
+
+
 def prepare_ligand(mol, name, cfg, out_dir):
     try:
         # If Target pH is requested and molecule came from SMILES, run OpenBabel pH correction
@@ -693,6 +802,113 @@ def prepare_ligand(mol, name, cfg, out_dir):
     except Exception as e:
         import traceback
         return None, traceback.format_exc()
+
+
+def prepare_protein(pdb_path, cfg):
+    """Full protein preparation pipeline (steps 1-7). Returns path to prepared PDB."""
+    prep_log = []
+    out_path = pdb_path.replace(".pdb", "_prepared.pdb")
+    
+    # ── Steps 1-5: PDBFixer-based preparation ──
+    try:
+        from pdbfixer import PDBFixer
+        from openmm.app import PDBFile
+        
+        # Load directly from original PDB (avoid intermediate file issues)
+        fixer = PDBFixer(filename=pdb_path)
+        
+        # Step 1+2: Remove water and heteroatoms together via PDBFixer
+        if cfg.get("prep_remove_het", True) or cfg.get("prep_remove_water", True):
+            keep_water = not cfg.get("prep_remove_water", True)
+            fixer.removeHeterogens(keepWater=keep_water)
+            prep_log.append("Removed heteroatoms" + (" + water" if not keep_water else ""))
+        elif cfg.get("prep_remove_water", True):
+            fixer.removeHeterogens(keepWater=False)
+            prep_log.append("Removed water molecules")
+        
+        # Step 5: Find and model missing residues/loops
+        if cfg.get("prep_fix_loops", True):
+            fixer.findMissingResidues()
+            prep_log.append("Identified missing loops/residues")
+        
+        # Step 4: Fix missing atoms
+        if cfg.get("prep_fix_atoms", True):
+            fixer.findMissingAtoms()
+            fixer.addMissingAtoms()
+            prep_log.append("Repaired missing heavy atoms")
+        
+        # Step 3: Add hydrogens at pH
+        if cfg.get("prep_add_h", True):
+            ph = cfg.get("target_ph", 7.4)
+            fixer.addMissingHydrogens(ph)
+            prep_log.append(f"Added hydrogens at pH {ph}")
+        
+        # Write PDBFixer output
+        with open(out_path, "w") as f:
+            PDBFile.writeFile(fixer.topology, fixer.positions, f)
+        prep_log.append("PDBFixer preparation complete")
+        
+    except ImportError:
+        prep_log.append("[WARN] PDBFixer/OpenMM not installed — skipping steps 2-5")
+        # Manual fallback: at least strip water via line filtering
+        if cfg.get("prep_remove_water", True):
+            pdb_text = Path(pdb_path).read_text()
+            lines = [l for l in pdb_text.splitlines() if not (l.startswith(("HETATM", "ATOM")) and "HOH" in l)]
+            Path(out_path).write_text("\n".join(lines))
+            prep_log.append("Removed water molecules (manual fallback)")
+    except Exception as e:
+        prep_log.append(f"[WARN] PDBFixer error: {str(e)[:100]} — using raw PDB")
+    
+    # ── Step 6: Protonation states via propka ──
+    if cfg.get("prep_propka", False):
+        try:
+            import propka.run as propka_run
+            # propka needs a file path
+            mol_container = propka_run.single(out_path)
+            pka_info = []
+            for group in mol_container.conformations["AVR"].groups:
+                if hasattr(group, "pka_value") and group.pka_value is not None:
+                    pka_info.append(f"  {group.residue_type} {group.atom.chain_id}{group.atom.res_num}: pKa={group.pka_value:.2f}")
+            if pka_info:
+                prep_log.append(f"propka3: {len(pka_info)} titratable residues analyzed")
+            else:
+                prep_log.append("propka3: No titratable residues found")
+        except ImportError:
+            prep_log.append("[WARN] propka not installed — skipping protonation analysis")
+        except Exception as e:
+            prep_log.append(f"[WARN] propka error: {str(e)[:100]}")
+    
+    # ── Step 7: Energy minimization via OpenMM ──
+    if cfg.get("prep_minimize", False):
+        try:
+            from openmm.app import PDBFile, ForceField, Modeller, Simulation
+            from openmm import LangevinMiddleIntegrator, LocalEnergyMinimizer
+            import openmm.unit as unit
+            
+            pdb = PDBFile(out_path)
+            forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
+            modeller = Modeller(pdb.topology, pdb.positions)
+            
+            system = forcefield.createSystem(modeller.topology, 
+                                              nonbondedMethod=0,  # NoCutoff
+                                              constraints=None)
+            integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
+            simulation = Simulation(modeller.topology, system, integrator)
+            simulation.context.setPositions(modeller.positions)
+            
+            max_steps = cfg.get("prep_min_steps", 100)
+            LocalEnergyMinimizer.minimize(simulation.context, maxIterations=max_steps)
+            
+            positions = simulation.context.getState(getPositions=True).getPositions()
+            with open(out_path, "w") as f:
+                PDBFile.writeFile(simulation.topology, positions, f)
+            prep_log.append(f"Energy minimization complete ({max_steps} steps, Amber14)")
+        except ImportError:
+            prep_log.append("[WARN] OpenMM not installed — skipping minimization")
+        except Exception as e:
+            prep_log.append(f"[WARN] Minimization error: {str(e)[:100]} — using unminimized structure")
+    
+    return out_path, prep_log
 
 
 def prepare_receptor(pdb_path, out_dir):
@@ -929,8 +1145,9 @@ def batch_dock(rec_items, lig_items, boxes, cfg, out_dir, prog, status_el):
     n, backend = cfg.get("n_jobs",1), cfg.get("backend","loky")
     tasks = []
     for rname, rpdbqt, rpdb in rec_items:
+        rec_boxes = boxes.get(rname, list(boxes.values())[0] if boxes else [])
         for lname, lpdbqt in lig_items:
-            for box in boxes:
+            for box in rec_boxes:
                 tasks.append((rname, rpdbqt, rpdb, lname, lpdbqt, box))
             
     results = []
@@ -952,6 +1169,10 @@ def batch_dock(rec_items, lig_items, boxes, cfg, out_dir, prog, status_el):
             res["Receptor"] = rn
             res["Pocket"] = bx['name']
             res["rec_pdb"] = rpdb
+            # Generate complex PDB and binding site analysis for successful docks
+            if res["status"] == "success" and res.get("pose_sdf") and Path(res["pose_sdf"]).exists():
+                res["complex_pdb"] = build_complex_pdb(rpdb, res["pose_sdf"])
+                res["interactions"] = analyze_interactions(rpdb, res["pose_sdf"])
             results.append(res)
             prog.progress((i+1)/len(tasks))
     else:
@@ -967,9 +1188,14 @@ def batch_dock(rec_items, lig_items, boxes, cfg, out_dir, prog, status_el):
             res["Receptor"] = rn
             res["Pocket"] = bx['name']
             res["rec_pdb"] = rpdb
+            if res["status"] == "success" and res.get("pose_sdf") and Path(res["pose_sdf"]).exists():
+                res["complex_pdb"] = build_complex_pdb(rpdb, res["pose_sdf"])
+                res["interactions"] = analyze_interactions(rpdb, res["pose_sdf"])
             results.append(res)
             prog.progress((i+1)/len(tasks))
             
+    # Save terminal log to session state
+    st.session_state.terminal_log = "\n".join([re.sub(r'<[^>]+>', '', l) for l in shared_log])
     return results
 
 
@@ -1121,6 +1347,8 @@ def page_upload():
         if rec_files:
             st.session_state.rec_files_data = [(f.name, f.read()) for f in rec_files]
             for f in rec_files: f.seek(0)
+            # Set rec_bytes to first receptor for autobox compatibility
+            st.session_state.rec_bytes = st.session_state.rec_files_data[0][1]
             st.success(f"Loaded {len(rec_files)} receptor(s)")
         elif getattr(st.session_state, "rec_files_data", None):
             for rname, _ in st.session_state.rec_files_data:
@@ -1129,7 +1357,7 @@ def page_upload():
                 st.session_state.rec_files_data = None
                 st.session_state.rec_bytes = None
                 st.session_state.lig_files_data = []
-                st.session_state.boxes = []
+                st.session_state.boxes = {}
                 st.session_state.results = []
                 st.rerun()
 
@@ -1151,6 +1379,11 @@ def page_upload():
         elif getattr(st.session_state, "lig_files_data", None):
             for lname, _ in st.session_state.lig_files_data:
                 st.success(f"Loaded: {lname}")
+            if st.button("❌ Clear ligands", key="clear_lig"):
+                st.session_state.lig_files_data = []
+                st.session_state.admet_data = {}
+                st.session_state.results = []
+                st.rerun()
             
             st.markdown("")
             if st.checkbox("👁️ Preview Ligands (2D Structure)"):
@@ -1178,20 +1411,25 @@ def page_upload():
             if not getattr(st.session_state, "rec_files_data", None):
                 st.error("Upload at least one receptor PDB first.")
             else:
-                with tempfile.TemporaryDirectory() as td:
-                    rp = os.path.join(td,"rec.pdb")
-                    Path(rp).write_bytes(st.session_state.rec_files_data[0][1])
-                    rfp = None
-                    if ref_file:
-                        rfp = os.path.join(td,"ref.sdf")
-                        Path(rfp).write_bytes(ref_file.read())
-                    try:
-                        box = compute_autobox(rp, rfp, st.session_state.box_padding)
-                        box["name"] = "Autobox"
-                        st.session_state.boxes = [box]
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Autoboxing failed: {e}")
+                all_boxes = {}
+                for rname, rbytes in st.session_state.rec_files_data:
+                    with tempfile.TemporaryDirectory() as td:
+                        rp = os.path.join(td, rname)
+                        Path(rp).write_bytes(rbytes)
+                        rfp = None
+                        if ref_file:
+                            rfp = os.path.join(td, "ref.sdf")
+                            Path(rfp).write_bytes(ref_file.read())
+                            ref_file.seek(0)
+                        try:
+                            box = compute_autobox(rp, rfp, st.session_state.box_padding)
+                            box["name"] = "Autobox"
+                            all_boxes[rname] = [box]
+                        except Exception as e:
+                            st.error(f"Autoboxing failed for {rname}: {e}")
+                if all_boxes:
+                    st.session_state.boxes = all_boxes
+                    st.rerun()
                         
     with col_multi:
         st.session_state.multi_pocket = st.toggle("Multi-Pocket (Top 5)", value=st.session_state.get("multi_pocket", False))
@@ -1202,64 +1440,65 @@ def page_upload():
                 st.error("Upload at least one receptor PDB first.")
             else:
                 import subprocess
-                with tempfile.TemporaryDirectory() as td:
-                    rp = os.path.join(td, "rec.pdb")
-                    Path(rp).write_bytes(st.session_state.rec_files_data[0][1])
-                    try:
-                        subprocess.run(["fpocket", "-f", rp], cwd=td, capture_output=True, check=True)
-                        found_boxes = []
-                        max_pockets = 5 if st.session_state.multi_pocket else 1
-                        
-                        for i in range(1, max_pockets + 1):
-                            p_file = Path(td) / "rec_out" / "pockets" / f"pocket{i}_atm.pdb"
-                            if p_file.exists():
-                                bx = compute_autobox(str(p_file), None, st.session_state.box_padding)
-                                bx["name"] = f"Pocket {i}"
-                                found_boxes.append(bx)
-                                
-                        if found_boxes:
-                            st.session_state.boxes = found_boxes
-                            st.rerun()
-                        else:
-                            st.error("No pockets detected by fpocket.")
-                    except Exception as e:
-                        st.error(f"fpocket failed: {e}. Is it installed via setup.sh?")
+                all_boxes = {}
+                max_pockets = 5 if st.session_state.multi_pocket else 1
+                for rname, rbytes in st.session_state.rec_files_data:
+                    with tempfile.TemporaryDirectory() as td:
+                        rp = os.path.join(td, rname)
+                        Path(rp).write_bytes(rbytes)
+                        try:
+                            subprocess.run(["fpocket", "-f", rp], cwd=td, capture_output=True, check=True)
+                            found_boxes = []
+                            stem = Path(rname).stem
+                            for i in range(1, max_pockets + 1):
+                                p_file = Path(td) / f"{stem}_out" / "pockets" / f"pocket{i}_atm.pdb"
+                                if p_file.exists():
+                                    bx = compute_autobox(str(p_file), None, st.session_state.box_padding)
+                                    bx["name"] = f"Pocket {i}"
+                                    found_boxes.append(bx)
+                            if found_boxes:
+                                all_boxes[rname] = found_boxes
+                            else:
+                                st.warning(f"No pockets detected for {rname}.")
+                        except Exception as e:
+                            st.error(f"fpocket failed for {rname}: {e}")
+                if all_boxes:
+                    st.session_state.boxes = all_boxes
+                    st.rerun()
 
     if st.session_state.boxes:
-        num_boxes = len(st.session_state.boxes)
-        if num_boxes <= 2:
-            # Full grid display for 1-2 pockets
-            for b in st.session_state.boxes:
-                st.markdown(f"**{b['name']}**")
-                st.markdown(
-                    '<div class="box-grid" style="margin-bottom: 0.6rem;">'
-                    + "".join(f'<div class="box-cell"><div class="box-val">{b[k]:.1f}</div>'
-                               f'<div class="box-lbl">{l}</div></div>'
-                               for k,l in [("cx","Center X"),("cy","Center Y"),("cz","Center Z"),
-                                           ("sx","Size X"),("sy","Size Y"),("sz","Size Z")])
-                    + "</div>",
-                    unsafe_allow_html=True
-                )
-        else:
-            # Compact summary table for 3+ pockets
-            st.markdown(f"**{num_boxes} Binding Pockets Detected**")
-            pocket_rows = ""
-            for b in st.session_state.boxes:
-                pocket_rows += f'''<tr>
-                    <td style="font-weight:600;color:#EAEAEA;">{b["name"]}</td>
-                    <td>{b["cx"]:.1f}, {b["cy"]:.1f}, {b["cz"]:.1f}</td>
-                    <td>{b["sx"]:.0f} × {b["sy"]:.0f} × {b["sz"]:.0f}</td>
-                </tr>'''
-            st.markdown(f'''
-            <table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:0.5rem;">
-                <thead><tr style="border-bottom:1px solid rgba(255,255,255,0.1);">
-                    <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Pocket</th>
-                    <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Center (X, Y, Z)</th>
-                    <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Size (Å)</th>
-                </tr></thead>
-                <tbody style="color:#D2D2D2;">{pocket_rows}</tbody>
-            </table>
-            ''', unsafe_allow_html=True)
+        for rname, rboxes in st.session_state.boxes.items():
+            st.markdown(f"**{rname}** — {len(rboxes)} pocket(s)")
+            if len(rboxes) <= 2:
+                for b in rboxes:
+                    st.markdown(f"*{b['name']}*")
+                    st.markdown(
+                        '<div class="box-grid" style="margin-bottom: 0.6rem;">'
+                        + "".join(f'<div class="box-cell"><div class="box-val">{b[k]:.1f}</div>'
+                                   f'<div class="box-lbl">{l}</div></div>'
+                                   for k,l in [("cx","Center X"),("cy","Center Y"),("cz","Center Z"),
+                                               ("sx","Size X"),("sy","Size Y"),("sz","Size Z")])
+                        + "</div>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                pocket_rows = ""
+                for b in rboxes:
+                    pocket_rows += f'''<tr>
+                        <td style="font-weight:600;color:#EAEAEA;">{b["name"]}</td>
+                        <td>{b["cx"]:.1f}, {b["cy"]:.1f}, {b["cz"]:.1f}</td>
+                        <td>{b["sx"]:.0f} × {b["sy"]:.0f} × {b["sz"]:.0f}</td>
+                    </tr>'''
+                st.markdown(f'''
+                <table style="width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:0.5rem;">
+                    <thead><tr style="border-bottom:1px solid rgba(255,255,255,0.1);">
+                        <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Pocket</th>
+                        <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Center (X, Y, Z)</th>
+                        <th style="text-align:left;padding:6px 10px;color:#888;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.06em;">Size (Å)</th>
+                    </tr></thead>
+                    <tbody style="color:#D2D2D2;">{pocket_rows}</tbody>
+                </table>
+                ''', unsafe_allow_html=True)
         
         if getattr(st.session_state, "rec_files_data", None):
             show_3d = st.checkbox("Show 3D Box Preview", value=False, key="show_box_preview")
@@ -1269,14 +1508,16 @@ def page_upload():
                     sel_rec_name = st.selectbox("Receptor for preview", rec_names, key="preview_rec")
                     sel_rec_bytes = next(b for n, b in st.session_state.rec_files_data if n == sel_rec_name)
                 else:
+                    sel_rec_name = st.session_state.rec_files_data[0][0]
                     sel_rec_bytes = st.session_state.rec_files_data[0][1]
-                render_box_preview(sel_rec_bytes, st.session_state.boxes)
+                render_box_preview(sel_rec_bytes, st.session_state.boxes.get(sel_rec_name, []))
 
     st.divider()
     _s1, c1, c2, c3, _s2 = st.columns([1, 1, 1, 1, 1])
     c1.metric("Receptor",  "Ready" if st.session_state.rec_bytes else "Optional")
     c2.metric("Ligands",   len(st.session_state.lig_files_data) or "Missing")
-    c3.metric("Box",       f"{len(st.session_state.boxes)} ready" if st.session_state.boxes else "Not set")
+    _total_boxes = sum(len(v) for v in st.session_state.boxes.values()) if st.session_state.boxes else 0
+    c3.metric("Box",       f"{_total_boxes} ready" if _total_boxes else "Not set")
 
     st.markdown("")
     ready = st.session_state.lig_files_data and st.session_state.boxes
@@ -1330,69 +1571,18 @@ def page_settings():
             st.session_state.engine = "GNINA"; st.rerun()
 
     engine = st.session_state.engine
-    st.markdown('<hr style="border:none;border-top:1px solid #1e2530;margin:1.2rem 0 1rem">', unsafe_allow_html=True)
+    # ── 4-Tab Settings Layout ──────────────────────────────────────────────────
+    tab_eng, tab_lig, tab_prot, tab_box = st.tabs([
+        "⚙️ Engine", "🧪 Ligand Prep", "🧬 Protein Prep", "📦 Box & Parallel"
+    ])
 
-    # Three-column settings layout
-    col_a, col_b, col_c = st.columns(3, gap="large")
-
-    with col_a:
-        st.markdown("#### Ligand Preparation (RDKit)")
-        st.caption("Controls how ligands are converted to 3D structures.")
-
-        st.session_state.target_ph = st.number_input(
-            "Target pH (OpenBabel)", min_value=0.0, max_value=14.0, value=st.session_state.get("target_ph", 7.4), step=0.1,
-            help="If input is 1D SMILES, OpenBabel will protonate the molecule to match this pH before 3D embedding.")
-        st.session_state.embed_method = st.selectbox(
-            "Embedding method",
-            ["ETKDGv3","ETKDGv2","ETKDG"],
-            index=["ETKDGv3","ETKDGv2","ETKDG"].index(st.session_state.embed_method),
-            help="Algorithm for generating the 3D shape of the ligand. ETKDGv3 is the most accurate.")
-        st.session_state.max_attempts = st.slider(
-            "Max embedding attempts", 10, 5000, st.session_state.max_attempts, step=50,
-            help="How many times RDKit will retry if 3D generation fails.")
-        st.session_state.force_field = st.selectbox(
-            "Force field", ["MMFF94","MMFF94s","UFF"],
-            index=["MMFF94","MMFF94s","UFF"].index(st.session_state.force_field),
-            help="Energy function used to optimise the 3D geometry.")
-        st.session_state.ff_steps = st.slider(
-            "Force field steps", 0, 2000, st.session_state.ff_steps, step=100,
-            help="Number of geometry optimisation steps. Higher = more accurate, slower.")
-        st.session_state.add_hs = st.toggle(
-            "Add hydrogens", st.session_state.add_hs,
-            help="Adds explicit hydrogen atoms before 3D embedding.")
-        st.session_state.keep_chirality = st.toggle(
-            "Preserve chirality", st.session_state.keep_chirality,
-            help="Maintains stereocenters (R/S) from the input molecule.")
-        
-        if st.checkbox("ℹ️ Learn more about RDKit parameters"):
-            st.info("""
-            **Embedding Method:** Mathematical algorithm used to fold 2D drugs into 3D space. **ETKDGv3** is the latest industry standard combining distance geometry with experimental torsion-angle knowledge.  
-            **Force Field:** A physics engine (like MMFF94) that relaxes the 3D molecule by subtly shifting its atoms to minimize internal strain energy before docking.
-            """, icon="🧠")
-
-        st.markdown('<hr style="border:none;border-top:1px solid #1e2530;margin:1.5rem 0 1rem">', unsafe_allow_html=True)
-        st.markdown("**PDBQT Conversion** — Meeko")
-        st.caption("Controls how the prepared ligand is written to the PDBQT format.")
-        st.session_state.merge_nphs = st.toggle(
-            "Merge non-polar H", st.session_state.merge_nphs,
-            help="Absorbs non-polar hydrogens into their parent heavy atom. Standard practice for AD4 scoring.")
-        st.session_state.hydrate = st.toggle(
-            "Add hydration waters", st.session_state.hydrate,
-            help="Adds explicit water molecules around the ligand for hydrated docking.")
-            
-        if st.checkbox("ℹ️ Learn more about Meeko parameters"):
-            st.info("""
-            **Merge non-polar H:** Traditional AutoDock format requires non-polar hydrogen atoms (like those attached to Carbons) to be logically absorbed into their parent atom to speed up computation. **Always leave this ON.**  
-            **Add hydration waters:** Wraps the drug in a simulated shell of water molecules. Useful if you suspect the drug binds via a 'water bridge' to the target protein.
-            """, icon="💧")
-
-    with col_b:
+    with tab_eng:
+        st.caption("Choose the docking engine. AutoDock Vina works on every system. GNINA requires an NVIDIA GPU for best performance.")
         if engine == "AutoDock Vina":
-            st.markdown("#### AutoDock Vina")
-            st.caption("Controls the docking search and scoring.")
+            st.markdown("#### AutoDock Vina settings")
             st.session_state.v_exhaustiveness = st.slider(
                 "Exhaustiveness", 1, 32, st.session_state.v_exhaustiveness,
-                help="How thoroughly Vina searches the binding site. Higher = better results, slower. Default 8 is fine.")
+                help="How thoroughly Vina searches the binding site. Higher = better results, slower.")
             st.session_state.v_num_poses = st.slider(
                 "Number of poses", 1, 20, st.session_state.v_num_poses,
                 help="How many docked poses to return per ligand.")
@@ -1406,18 +1596,15 @@ def page_settings():
             st.session_state.vina_seed = st.number_input(
                 "Random seed", 0, 99999, st.session_state.vina_seed,
                 help="Set to a non-zero value for reproducible results.")
-                
             if st.checkbox("ℹ️ Learn more about Vina parameters"):
                 st.info("""
-                **Exhaustiveness:** The single most important parameter! It commands how many independent physics simulations run in parallel inside the box.  
-                - `8`: Lightning fast, great for screening thousands of drugs.  
-                - `32`: Extremely slow, but highly accurate for final publications.  
-                
-                **Energy Range:** Vina only outputs variant poses that are within X kcal/mol of the mathematically best pose. Default is 3. Increase this if you want Vina to show you "worse" but radically different binding angles.
+                **Exhaustiveness:** The single most important parameter — controls how many independent physics simulations run inside the box.
+                - `8`: Fast, great for screening. `32`: Slow but highly accurate for publications.
+
+                **Energy Range:** Only shows poses within X kcal/mol of the best pose. Increase to see radically different binding angles.
                 """, icon="⚡")
         else:
-            st.markdown("#### GNINA")
-            st.caption("GNINA adds CNN-based pose scoring on top of Vina search.")
+            st.markdown("#### GNINA settings")
             st.session_state.exhaustiveness = st.slider(
                 "Exhaustiveness", 1, 64, st.session_state.exhaustiveness,
                 help="Search thoroughness.")
@@ -1427,81 +1614,174 @@ def page_settings():
                 "CNN model", ["default","dense","crossdocked_default2018"],
                 index=["default","dense","crossdocked_default2018"].index(st.session_state.cnn_model),
                 help="Neural network model for CNN scoring.")
-            # ── Guardrail 1: Hardware-Aware CNN Toggle ──
             cnn_modes_available = ["none", "rescore", "refinement", "all"]
             if gpu_warn:
                 cnn_modes_available = ["none", "rescore"]
                 if st.session_state.cnn_mode in ("refinement", "all"):
                     st.session_state.cnn_mode = "rescore"
-                st.info("⚠️ GPU not detected. CNN Refinement & All modes are disabled to prevent system freezing. Using fast CNN Rescoring instead.", icon="🖥️")
+                st.info("⚠️ GPU not detected. CNN Refinement & All modes disabled.", icon="🖥️")
             st.session_state.cnn_mode = st.selectbox(
                 "CNN Mode", cnn_modes_available,
                 index=cnn_modes_available.index(st.session_state.cnn_mode),
-                help="none: skip AI scoring. rescore: fast Vina search then AI grading. refinement: AI guides the physical energy minimization (10x slower, GPU required).")
+                help="none: skip AI. rescore: fast Vina then AI grading. refinement: AI guides minimization (10x slower, GPU required).")
             st.session_state.cnn_weight = st.slider(
                 "CNN scoring weight", 0.0, 1.0, st.session_state.cnn_weight, 0.05,
-                help="1.0 = pure CNN, 0.0 = pure Vina score for pose ranking.")
+                help="1.0 = pure CNN, 0.0 = pure Vina score.")
             st.session_state.min_rmsd = st.slider(
-                "Min RMSD between poses (A)", 0.5, 3.0, st.session_state.min_rmsd, 0.1)
-            st.session_state.gnina_seed = st.number_input("Seed", 0, 99999, st.session_state.gnina_seed)
-            st.session_state.gpu_device = st.selectbox(
+                "Min RMSD between poses (Å)", 0.5, 3.0, st.session_state.min_rmsd, 0.1)
+            c1g, c2g = st.columns(2)
+            st.session_state.gnina_seed = c1g.number_input("Seed", 0, 99999, st.session_state.gnina_seed)
+            st.session_state.gpu_device = c2g.selectbox(
                 "GPU device", ["auto","0","1","cpu"],
                 index=["auto","0","1","cpu"].index(st.session_state.gpu_device))
-
-            # ── Guardrail 2: Flexible Residue Cap ──
             st.session_state.flexdist = st.toggle(
                 "Flexible Docking (Induced Fit)", st.session_state.flexdist,
-                help="Automatically allows receptor side-chains within 3.5 Å of the pocket center to move, simulating biological induced fit.")
+                help="Allows receptor side-chains within 3.5 Å of the pocket to flex.")
             if st.session_state.flexdist:
                 st.session_state.max_flex_res = st.slider(
                     "Max flexible residues", 1, 5, st.session_state.get("max_flex_res", 4),
-                    help="Hard cap on residues allowed to flex. More than 4 causes exponentially long compute times and artificial scoring.")
-                st.warning("⚡ Flexible docking is extremely compute-intensive. Each additional residue multiplies docking time ~3x. Keep to ≤4 residues for practical runtimes.", icon="⏳")
-                
+                    help="Hard cap — more than 4 causes exponentially long compute times.")
+                st.warning("⚡ Each additional residue multiplies docking time ~3x. Keep ≤4.", icon="⏳")
             if st.checkbox("ℹ️ Learn more about GNINA parameters"):
                 st.info("""
-                **CNN Scoring Weight:** GNINA ranks drugs using two distinct brains: an old-school physics equation (Vina) and a modern Deep Learning Neural Network (CNN).  
-                - `0.0`: The Neural Network is ignored. Traditional physics wins.  
-                - `1.0`: Pure AI structural recognition.  
-                
-                **CNN Mode:** Controls how deeply the Neural Network integrates with the physics engine.  
-                - `none`: Fastest. Bypasses the Neural Network completely.  
-                - `rescore`: Default. Uses fast Vina physics to generate poses, then the Neural Network grades them.  
-                - `refinement`: Slowest (>10x). The Neural Network actively overrides the physics engine to pull the ligand into the most perfect biological pose dynamically.  
-                
-                **Flexible Docking (Induced Fit)**: The most physically accurate (and computationally expensive) mode. GNINA will physically rotate and bend the protein's native amino acids to make room for the drug.  
-                *Note: Flexible docking incurs massive "deformation" energy penalties. A perfectly fine CNN Probability (0.85) may result in a terrible or even positive Empirical Vina Score (e.g. +1.5 kcal/mol) because the physics engine penalizes the protein being stretched out of its natural shape.*
+                **CNN Weight:** 0.0 = pure physics, 1.0 = pure AI. Values around 0.5 balance both.
+
+                **CNN Mode:** `rescore` is the default (fast). `refinement` actively reshapes poses using AI (>10x slower, GPU required).
+
+                **Flexible Docking:** Protein side-chains physically bend to accommodate the ligand. Vina scores may look worse due to deformation penalties — use CNN Probability instead.
                 """, icon="🤖")
 
-    with col_c:
-        st.markdown("#### Docking Box")
-        st.caption("The 3D search region. Calculated automatically on the Upload page.")
-        st.session_state.box_padding = st.slider(
-            "Autobox padding (A)", 1, 20, st.session_state.box_padding,
-            help="Extra space (in Angstroms) added around the receptor or reference ligand when computing the box.")
-        manual = st.toggle("Manual box override (Pocket 1)", False)
-        if manual:
-            cc, cs = st.columns(2)
-            cbox = st.session_state.boxes[0] if st.session_state.boxes else None
-            cx = cc.number_input("Center X", value=cbox["cx"] if cbox else 0.0)
-            cy = cc.number_input("Center Y", value=cbox["cy"] if cbox else 0.0)
-            cz = cc.number_input("Center Z", value=cbox["cz"] if cbox else 0.0)
-            sx = cs.number_input("Size X", value=cbox["sx"] if cbox else 20.0)
-            sy = cs.number_input("Size Y", value=cbox["sy"] if cbox else 20.0)
-            sz = cs.number_input("Size Z", value=cbox["sz"] if cbox else 20.0)
-            # Override all boxes with just 1 manual box
-            st.session_state.boxes = [{"name": "Manual", "cx":cx,"cy":cy,"cz":cz,"sx":sx,"sy":sy,"sz":sz}]
+    with tab_lig:
+        st.caption("Controls how ligand files are converted into 3D structures ready for docking.")
+        c_a, c_b = st.columns(2, gap="large")
+        with c_a:
+            st.markdown("**3D Generation (RDKit)**")
+            st.session_state.target_ph = st.number_input(
+                "Target pH", min_value=0.0, max_value=14.0,
+                value=st.session_state.get("target_ph", 7.4), step=0.1,
+                help="If input is 1D SMILES, OpenBabel protonates the molecule at this pH before 3D embedding.")
+            st.session_state.embed_method = st.selectbox(
+                "Embedding method", ["ETKDGv3","ETKDGv2","ETKDG"],
+                index=["ETKDGv3","ETKDGv2","ETKDG"].index(st.session_state.embed_method),
+                help="Algorithm for generating the 3D shape. ETKDGv3 is the most accurate.")
+            st.session_state.max_attempts = st.slider(
+                "Max embedding attempts", 10, 5000, st.session_state.max_attempts, step=50,
+                help="How many times RDKit will retry if 3D generation fails.")
+            st.session_state.force_field = st.selectbox(
+                "Force field", ["MMFF94","MMFF94s","UFF"],
+                index=["MMFF94","MMFF94s","UFF"].index(st.session_state.force_field),
+                help="Energy function used to optimise the 3D geometry.")
+            st.session_state.ff_steps = st.slider(
+                "Force field steps", 0, 2000, st.session_state.ff_steps, step=100,
+                help="Geometry optimisation steps. More steps = more accurate but slower.")
+            st.session_state.add_hs = st.toggle("Add hydrogens", st.session_state.add_hs,
+                help="Adds explicit hydrogen atoms before 3D embedding.")
+            st.session_state.keep_chirality = st.toggle("Preserve chirality", st.session_state.keep_chirality,
+                help="Maintains stereocenters (R/S) from the input molecule.")
+        with c_b:
+            st.markdown("**PDBQT Conversion (Meeko)**")
+            st.session_state.merge_nphs = st.toggle(
+                "Merge non-polar H", st.session_state.merge_nphs,
+                help="Absorbs non-polar hydrogens into their parent heavy atom. Standard for AD4 scoring.")
+            st.session_state.hydrate = st.toggle(
+                "Add hydration waters", st.session_state.hydrate,
+                help="Adds explicit water molecules around the ligand for hydrated docking.")
+            st.markdown("")
+            if st.checkbox("ℹ️ Learn more", key="learn_more_lig"):
+                st.info("""
+                **ETKDGv3:** Latest RDKit 3D conformer algorithm — uses experimental torsion knowledge for drug-like molecules.
 
-        st.markdown('<hr style="border:none;border-top:1px solid #1e2530;margin:1.5rem 0 1rem">', unsafe_allow_html=True)
-        st.markdown("**Parallelization**")
-        max_cpu = os.cpu_count() or 4
-        st.session_state.n_jobs = st.slider(
-            "CPU cores", 1, max_cpu, st.session_state.n_jobs, key="njobs_slider",
-            help="Number of ligands to dock in parallel. Set to 1 for live progress updates.")
-        st.session_state.backend = st.selectbox(
-            "Parallel backend", ["loky","threading","multiprocessing"],
-            index=["loky","threading","multiprocessing"].index(st.session_state.backend),
-            help="loky is the default and most stable. threading can be faster for I/O-bound tasks.")
+                **MMFF94:** Standard force field for organic molecules. Minimises internal strain before docking.
+
+                **Merge non-polar H:** Required for AutoDock PDBQT format. Non-polar H atoms are absorbed into their parent carbons.
+                """, icon="🧠")
+
+    with tab_prot:
+        st.caption("Automated receptor cleaning and repair pipeline. Runs automatically before docking on every uploaded receptor.")
+        c_p1, c_p2 = st.columns(2, gap="large")
+        with c_p1:
+            st.markdown("**Cleaning**")
+            st.session_state.prep_remove_water = st.toggle(
+                "Remove water (HOH)", st.session_state.prep_remove_water,
+                help="Strip all crystallographic water molecules from the PDB file.")
+            st.session_state.prep_remove_het = st.toggle(
+                "Remove heteroatoms", st.session_state.prep_remove_het,
+                help="Remove co-crystallized ligands, buffer molecules, and non-protein atoms.")
+            if st.session_state.prep_remove_het:
+                st.session_state.prep_keep_metals = st.toggle(
+                    "  ↳ Keep metal ions", st.session_state.prep_keep_metals,
+                    help="Preserve metal ions (Zn²⁺, Mg²⁺, Ca²⁺) that may be important for catalysis.")
+            st.markdown("**Repair**")
+            st.session_state.prep_add_h = st.toggle(
+                "Add hydrogens at pH", st.session_state.prep_add_h,
+                help="Add missing hydrogen atoms at the target pH using PDBFixer.")
+            st.session_state.prep_fix_atoms = st.toggle(
+                "Fix missing atoms", st.session_state.prep_fix_atoms,
+                help="Detect and rebuild missing heavy atoms in incomplete residues.")
+            st.session_state.prep_fix_loops = st.toggle(
+                "Model missing loops", st.session_state.prep_fix_loops,
+                help="Identify and model missing residues/loops in the crystal structure.")
+        with c_p2:
+            st.markdown("**Advanced** *(slower)*")
+            st.session_state.prep_propka = st.toggle(
+                "propka protonation states", st.session_state.prep_propka,
+                help="Run propka3 to predict pKa values for titratable residues (His, Glu, Asp, Lys, Cys).")
+            st.session_state.prep_minimize = st.toggle(
+                "Energy minimization (OpenMM)", st.session_state.prep_minimize,
+                help="Quick Amber14 energy minimization to relax steric clashes in the receptor.")
+            if st.session_state.prep_minimize:
+                st.session_state.prep_min_steps = st.slider(
+                    "Minimization steps", 50, 1000, st.session_state.prep_min_steps, step=50,
+                    help="L-BFGS iterations. More steps = better but slower.")
+            st.markdown("")
+            if st.checkbox("ℹ️ Learn more", key="learn_more_prot"):
+                st.info("""
+                **Water/Heteroatom removal:** Crystal structures contain buffer salts, co-crystallized inhibitors, and ordered water — almost always removed before docking.
+
+                **PDBFixer repairs:** Missing atoms and loops from unresolved crystal regions are modelled automatically.
+
+                **propka:** Predicts protonation states of His, Glu, Asp residues at your target pH.
+
+                **Minimization:** Amber14 relaxation resolves steric clashes from crystal packing or PDBFixer repairs.
+                """, icon="🔬")
+
+    with tab_box:
+        c_bx, c_par = st.columns(2, gap="large")
+        with c_bx:
+            st.markdown("**Docking Box**")
+            st.caption("The 3D search region. Set on the Upload page via Autobox or fpocket.")
+            st.session_state.box_padding = st.slider(
+                "Autobox padding (Å)", 1, 20, st.session_state.box_padding,
+                help="Extra space added around the receptor when computing the box.")
+            manual = st.toggle("Manual box override", False)
+            if manual:
+                cc, cs = st.columns(2)
+                cbox = None
+                if st.session_state.boxes:
+                    first_boxes = list(st.session_state.boxes.values())[0]
+                    cbox = first_boxes[0] if first_boxes else None
+                cx = cc.number_input("Center X", value=cbox["cx"] if cbox else 0.0)
+                cy = cc.number_input("Center Y", value=cbox["cy"] if cbox else 0.0)
+                cz = cc.number_input("Center Z", value=cbox["cz"] if cbox else 0.0)
+                sx = cs.number_input("Size X", value=cbox["sx"] if cbox else 20.0)
+                sy = cs.number_input("Size Y", value=cbox["sy"] if cbox else 20.0)
+                sz = cs.number_input("Size Z", value=cbox["sz"] if cbox else 20.0)
+                manual_box = {"name": "Manual", "cx":cx,"cy":cy,"cz":cz,"sx":sx,"sy":sy,"sz":sz}
+                if getattr(st.session_state, "rec_files_data", None):
+                    st.session_state.boxes = {rn: [manual_box.copy()] for rn, _ in st.session_state.rec_files_data}
+                else:
+                    st.session_state.boxes = {"manual": [manual_box]}
+        with c_par:
+            st.markdown("**Parallelization**")
+            st.caption("Run multiple docking jobs simultaneously.")
+            max_cpu = os.cpu_count() or 4
+            st.session_state.n_jobs = st.slider(
+                "CPU cores", 1, max_cpu, st.session_state.n_jobs, key="njobs_slider",
+                help="Number of ligands to dock in parallel. Set to 1 for live progress updates.")
+            st.session_state.backend = st.selectbox(
+                "Parallel backend", ["loky","threading","multiprocessing"],
+                index=["loky","threading","multiprocessing"].index(st.session_state.backend),
+                help="loky is stable. threading is faster for I/O-bound tasks.")
 
 
     st.divider()
@@ -1554,7 +1834,9 @@ def build_pdf_report(df, engine, cfg=None):
             config_items.append(("Exhaustiveness", str(cfg.get("v_exhaustiveness", 8))))
             config_items.append(("Poses", str(cfg.get("v_num_poses", 9))))
             config_items.append(("Energy Range", f"{cfg.get('energy_range', 3)} kcal/mol"))
-        config_items.append(("Pockets", str(len(st.session_state.get("boxes", [])))))
+        _boxes = st.session_state.get("boxes", {})
+        _npock = sum(len(v) for v in _boxes.values()) if isinstance(_boxes, dict) else len(_boxes)
+        config_items.append(("Pockets", str(_npock)))
         config_items.append(("Force Field", cfg.get("force_field", "MMFF94")))
 
     for label, value in config_items:
@@ -1644,16 +1926,87 @@ def build_zip_archive(results, df, engine, session_state, cfg=None):
                 zf.writestr(f"inputs/{rname}", rbytes)
                 pml_recs.append(rname)
         
-        # 4. Add Outputs (Poses)
+        # 4. Add Outputs — grouped by receptor
         pml_poses = []
         ok_res = [r for r in results if r["status"] == "success" and r.get("pose_sdf") and Path(r["pose_sdf"]).exists()]
         for r in ok_res:
+            rec_folder = r.get("Receptor", "unknown").replace(".pdb", "")
             safe_lname = r["name"]
-            sdf_name = f"outputs/{safe_lname}_pose.sdf"
-            zf.writestr(sdf_name, Path(r["pose_sdf"]).read_bytes())
-            pml_poses.append(f"{safe_lname}_pose.sdf")
             
-        # 5. Generate PyMOL Script
+            # Pose SDF
+            sdf_name = f"outputs/{rec_folder}/{safe_lname}_pose.sdf"
+            zf.writestr(sdf_name, Path(r["pose_sdf"]).read_bytes())
+            pml_poses.append((rec_folder, f"{safe_lname}_pose.sdf"))
+            
+            # Complex PDB
+            cpdb = r.get("complex_pdb")
+            if cpdb and Path(cpdb).exists():
+                zf.writestr(f"outputs/{rec_folder}/{safe_lname}_complex.pdb", Path(cpdb).read_bytes())
+            
+            # Binding site interactions CSV
+            idf = r.get("interactions")
+            if isinstance(idf, pd.DataFrame) and not idf.empty:
+                zf.writestr(f"outputs/{rec_folder}/{safe_lname}_interactions.csv", idf.to_csv(index=False))
+        
+        # 5. Add terminal log
+        term_log = session_state.get("terminal_log", "")
+        if term_log:
+            zf.writestr("run_log.txt", term_log)
+        
+        # 6. Generate summary.txt
+        from datetime import datetime
+        summary_lines = [
+            "STRATADOCK EXPERIMENT SUMMARY",
+            "=" * 60,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Engine: {engine}",
+            f"Total jobs: {len(results)}",
+            f"Successful: {len(ok_res)}",
+            f"Failed: {len(results) - len(ok_res)}",
+            "",
+        ]
+        # Group results by receptor
+        from collections import defaultdict
+        by_rec = defaultdict(list)
+        for r in results:
+            by_rec[r.get('Receptor', 'unknown')].append(r)
+        
+        for rec_name, rec_results in by_rec.items():
+            summary_lines.append("=" * 60)
+            summary_lines.append(f"RECEPTOR: {rec_name}")
+            summary_lines.append("=" * 60)
+            ok_r = [r for r in rec_results if r['status'] == 'success']
+            summary_lines.append(f"  Successful docks: {len(ok_r)}/{len(rec_results)}")
+            summary_lines.append("")
+            
+            for r in rec_results:
+                summary_lines.append(f"  --- {r.get('Ligand', r.get('name', '?'))} [{r.get('Pocket', '?')}] ---")
+                summary_lines.append(f"    Status: {r['status']}")
+                if r['status'] == 'success':
+                    if r.get('vina_score') is not None:
+                        summary_lines.append(f"    Vina Score: {r['vina_score']:.2f} kcal/mol")
+                    if r.get('cnn_score') is not None:
+                        summary_lines.append(f"    CNN Pose Prob: {r['cnn_score']:.4f}")
+                    if r.get('cnn_affinity') is not None:
+                        summary_lines.append(f"    CNN Affinity: {r['cnn_affinity']:.3f} pKd")
+                    # Interaction summary
+                    idf = r.get('interactions')
+                    if isinstance(idf, pd.DataFrame) and not idf.empty:
+                        summary_lines.append(f"    Interacting residues: {len(idf)}")
+                        bond_counts = idf['Bond Type'].value_counts()
+                        for btype, cnt in bond_counts.items():
+                            summary_lines.append(f"      {btype}: {cnt}")
+                        summary_lines.append("    Key residues:")
+                        for _, row in idf.head(10).iterrows():
+                            summary_lines.append(f"      {row['Residue']} {row['Chain']}{row['ResID']} "
+                                                 f"({row['Receptor Atom']}) — {row['Distance (Å)']:.2f} Å [{row['Bond Type']}]")
+                summary_lines.append("")
+        
+        summary_lines.append("=" * 60)
+        summary_lines.append("End of Report")
+        zf.writestr("summary.txt", "\n".join(summary_lines))
+            
+        # 6. Generate PyMOL Script
         if pml_recs and pml_poses:
             pml = [
                 "# StrataDock Auto-Generated PyMOL Visualization Script",
@@ -1662,7 +2015,6 @@ def build_zip_archive(results, df, engine, session_state, cfg=None):
                 "set ray_trace_fog, 1",
                 "set antialias, 2"
             ]
-            # Load and format receptors
             for r in pml_recs:
                 obj_name = r.replace(".pdb","")
                 pml.append(f"load inputs/{r}, {obj_name}")
@@ -1673,12 +2025,11 @@ def build_zip_archive(results, df, engine, session_state, cfg=None):
                 pml.append(f"show surface, {obj_name}")
                 pml.append(f"set transparency, 0.6, {obj_name}")
             
-            # Load and format ligands
-            for pose in pml_poses:
+            for rec_folder, pose in pml_poses:
                 obj_name = pose.replace(".sdf","")
-                pml.append(f"load outputs/{pose}, {obj_name}")
+                pml.append(f"load outputs/{rec_folder}/{pose}, {obj_name}")
                 pml.append(f"show sticks, {obj_name}")
-                pml.append(f"util.cbas {obj_name}") # Color by atom, carbon=cyan
+                pml.append(f"util.cbas {obj_name}")
             
             pml.append("center all")
             pml.append("zoom all, 5")
@@ -1715,7 +2066,7 @@ def page_run():
 
     # ── Guardrail 3: Compute Cost Estimator ──
     n_ligs = len(st.session_state.lig_files_data)
-    n_pockets = len(st.session_state.boxes)
+    n_pockets = sum(len(v) for v in st.session_state.boxes.values()) if st.session_state.boxes else 0
     exh = st.session_state.v_exhaustiveness if cfg["engine"] == "AutoDock Vina" else st.session_state.exhaustiveness
     total_jobs = n_ligs * n_pockets
     est_seconds = total_jobs * (15 if cfg["engine"] == "AutoDock Vina" else 25)
@@ -1752,6 +2103,17 @@ def page_run():
             status.caption(f"Preparing receptor {rname} ({i+1}/{len(st.session_state.rec_files_data)})…")
             rp = os.path.join(work_dir, rname)
             Path(rp).write_bytes(rbytes)
+            
+            # Run protein preparation pipeline (steps 1-7)
+            prep_cfg = {k: v for k, v in st.session_state.items() if k.startswith("prep_") or k == "target_ph"}
+            try:
+                prepared_pdb, prep_log = prepare_protein(rp, prep_cfg)
+                for msg in prep_log:
+                    status.caption(f"  ↳ {rname}: {msg}")
+                rp = prepared_pdb  # Use prepared PDB for PDBQT conversion
+            except Exception as e:
+                status.caption(f"  ↳ Protein prep failed ({e}), using raw PDB")
+            
             try:
                 rpdbqt = prepare_receptor(rp, work_dir)
                 rec_items.append((rname, rpdbqt, rp))
@@ -1873,7 +2235,7 @@ def page_results():
     st.markdown(f"""
     <div style="text-align:center; padding: 1.5rem 0 0.5rem;">
         <div class="page-title" style="margin-bottom:0.3rem;">Screening Results</div>
-        <div class="page-sub">{ok_count} successful docks · {engine} engine · {len(st.session_state.get('boxes',[]))} pocket(s)</div>
+        <div class="page-sub">{ok_count} successful docks · {engine} engine · {sum(len(v) for v in st.session_state.get('boxes',{}).values()) if isinstance(st.session_state.get('boxes'), dict) else len(st.session_state.get('boxes',[]))} pocket(s)</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1960,7 +2322,7 @@ def page_results():
     </div>
     """, unsafe_allow_html=True)
 
-    res_tab1, res_tab4, res_tab3 = st.tabs(["📊 Docking Scores", "💊 Pharmacokinetics", "🧊 3D Viewer"])
+    res_tab1, res_tab4, res_tab5, res_tab3 = st.tabs(["📊 Docking Scores", "💊 Pharmacokinetics", "🔬 Binding Site", "🧊 3D Viewer"])
 
     # Apply Dynamic Filter
     filtered_df = df[((df["Status"] == "success") & (df["Vina Forcefield (kcal/mol)"] <= vina_filter)) | (df["Status"] != "success")]
@@ -2054,15 +2416,52 @@ def page_results():
                 render_3d(r_match["rec_pdb"], r_match["pose_sdf"], view_style)
                 
                 if Path(r_match["pose_sdf"]).exists():
-                    st.download_button("Download pose SDF", Path(r_match["pose_sdf"]).read_bytes(), f"{sel_r}_{sel_l}_pose.sdf", use_container_width=True)
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button("Download pose SDF", Path(r_match["pose_sdf"]).read_bytes(), f"{sel_r}_{sel_l}_pose.sdf", use_container_width=True)
+                    with dl2:
+                        cpdb = r_match.get("complex_pdb")
+                        if cpdb and Path(cpdb).exists():
+                            st.download_button("Download complex PDB", Path(cpdb).read_bytes(), f"{sel_r}_{sel_l}_complex.pdb", use_container_width=True)
         else:
             st.info("No successful 3D poses generated.")
+
+    with res_tab5:
+        ok_results_bs = [r for r in res if r["status"]=="success" and isinstance(r.get("interactions"), pd.DataFrame) and not r["interactions"].empty]
+        if ok_results_bs:
+            bs1, bs2 = st.columns(2)
+            with bs1:
+                sel_r_bs = st.selectbox("Receptor", list({r["Receptor"] for r in ok_results_bs}), key="bs_rec")
+            with bs2:
+                sel_l_bs = st.selectbox("Ligand", [r["Ligand"] for r in ok_results_bs if r["Receptor"]==sel_r_bs], key="bs_lig")
+            
+            r_match_bs = next((r for r in ok_results_bs if r["Receptor"]==sel_r_bs and r["Ligand"]==sel_l_bs), None)
+            if r_match_bs is not None:
+                idf = r_match_bs["interactions"]
+                st.markdown(f"**{len(idf)} interacting residues** within 4.0 Å of docked pose")
+                st.dataframe(idf, use_container_width=True, height=400)
+                
+                # Summary stats
+                bond_counts = idf["Bond Type"].value_counts()
+                scols = st.columns(len(bond_counts))
+                for col, (btype, count) in zip(scols, bond_counts.items()):
+                    col.metric(btype, count)
+                
+                st.caption("Bond types are inferred from atom distances and element types. H-bonds: polar atoms < 3.5 Å. Hydrophobic: carbon-carbon contacts < 4.0 Å. Salt bridges: charged residue-polar ligand atom < 4.0 Å.")
+        else:
+            st.info("No binding site interaction data available. Run a docking experiment first.")
     
     # ── Re-run option ──
     st.markdown("")
-    if st.button("▶ Run Again with Different Settings", use_container_width=True):
-        st.session_state.page = "Run"
-        st.rerun()
+    r_col, l_col = st.columns([1, 1])
+    with r_col:
+        if st.button("▶ Run Again with Different Settings", use_container_width=True):
+            st.session_state.page = "Run"
+            st.rerun()
+    with l_col:
+        term_log = st.session_state.get("terminal_log", "")
+        if term_log:
+            st.download_button("📋 Download Run Log", term_log.encode("utf-8"), "stratadock_run_log.txt", mime="text/plain", use_container_width=True)
 
 
 # =============================================================================
@@ -2085,7 +2484,9 @@ def page_help():
             "keep_chirality", "merge_nphs", "hydrate", "exhaustiveness", "num_poses", 
             "cnn_model", "cnn_weight", "min_rmsd", "gnina_seed", "gpu_device", "flexdist", "cnn_mode",
             "v_exhaustiveness", "v_num_poses", "energy_range", "scoring_fn", "vina_seed", 
-            "n_jobs", "backend"
+            "n_jobs", "backend",
+            "prep_remove_water", "prep_remove_het", "prep_keep_metals", "prep_add_h",
+            "prep_fix_atoms", "prep_fix_loops", "prep_propka", "prep_minimize", "prep_min_steps"
         ]
         export_state = {k: st.session_state[k] for k in export_keys if k in st.session_state}
         
@@ -2125,11 +2526,20 @@ def page_help():
 
 **Step 2 — Settings**
 - Choose your **docking engine**. AutoDock Vina is recommended for most users and works on all CPUs. GNINA utilizes neural-network scoring and works best with an NVIDIA/AMD GPU.
+- Configure **Protein Preparation** — StrataDock can automatically:
+    - Remove water molecules and heteroatoms from crystal structures
+    - Add missing hydrogen atoms at physiological pH
+    - Repair missing atoms and model missing loops (PDBFixer)
+    - Assign protonation states via propka (advanced)
+    - Run energy minimization via OpenMM Amber14 (advanced)
 - Adjust molecular parameters if needed. **The default values are optimized for high-throughput screening.**
 
 **Step 3 — Run & Results**
 - Click **Run Docking**. The cinematic console will stream engine logs in real-time.
-- For bulk / N x M cross-docking (multiple receptors x multiple ligands), utilize the **Parallelization** settings to unleash your CPU cores.
+- Protein preparation runs automatically before docking (based on your settings).
+- For bulk / N × M cross-docking (multiple receptors × multiple ligands), utilize the **Parallelization** settings to unleash your CPU cores.
+- After running, view results across 4 tabs: **Docking Scores**, **Pharmacokinetics**, **Binding Site** (interacting residues), and **3D Viewer** (with complex PDB download).
+- Download the **ZIP archive** — organized by receptor with poses, complex PDBs, interaction CSVs, and a comprehensive `summary.txt`.
         """)
 
     with tab2:

@@ -99,13 +99,13 @@ CONDA_BASE=$("$CONDA_BIN" info --base)
 
 if "$CONDA_BIN" env list | grep -q "^$CONDA_ENV "; then
     info "Updating existing environment '$CONDA_ENV'..."
-    "$CONDA_BIN" install -n "$CONDA_ENV" -c conda-forge python=3.10 rdkit openbabel fpocket numpy scipy pandas biopython pillow gemmi joblib -y -q
+    "$CONDA_BIN" install -n "$CONDA_ENV" -c conda-forge python=3.10 rdkit openbabel fpocket numpy scipy pandas biopython pillow gemmi joblib openmm pdbfixer -y -q
     "$CONDA_BIN" install -n "$CONDA_ENV" -c nvidia cuda-toolkit=12.8 cudnn cuda-nvtx -y -q
     success "Environment updated"
 else
     info "Creating conda environment '$CONDA_ENV' with Python 3.10..."
     "$CONDA_BIN" create -n "$CONDA_ENV" python=3.10 -y
-    "$CONDA_BIN" install -n "$CONDA_ENV" -c conda-forge rdkit openbabel fpocket numpy scipy pandas biopython pillow gemmi joblib -y -q
+    "$CONDA_BIN" install -n "$CONDA_ENV" -c conda-forge rdkit openbabel fpocket numpy scipy pandas biopython pillow gemmi joblib openmm pdbfixer -y -q
     "$CONDA_BIN" install -n "$CONDA_ENV" -c nvidia cuda-toolkit=12.8 cudnn cuda-nvtx -y -q
     success "Conda environment created and packages installed"
 fi
@@ -122,7 +122,8 @@ info "Installing pure Python packages via Pip..."
     py3Dmol \
     ipython_genutils \
     plotly \
-    fpdf2
+    fpdf2 \
+    propka
 
 success "All Python packages installed"
 
@@ -154,6 +155,8 @@ fi
 header "Step 6/6 — Assembling the launchpad 🚀"
 
 mkdir -p "$INSTALL_DIR"
+info "Copying project files to $INSTALL_DIR..."
+cp -r ./* "$INSTALL_DIR/" 2>/dev/null || true
 
 cat > "$INSTALL_DIR/run.sh" << RUNSCRIPT
 #!/usr/bin/env bash
@@ -166,7 +169,7 @@ conda activate stratadock
 export PATH="\$HOME/.local/bin:\$PATH"
 export LD_LIBRARY_PATH="\$CONDA_BASE/envs/stratadock/lib:\$LD_LIBRARY_PATH"
 
-cd "\$HOME/stratadock"
+cd "\$(dirname "\$(realpath "\$0")")"
 echo ""
 echo "  StrataDock is starting..."
 echo "  Open your browser at: http://localhost:8501"
