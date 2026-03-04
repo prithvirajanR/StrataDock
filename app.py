@@ -512,7 +512,7 @@ def init_state():
         "target_ph": 7.4,
         # Protein Preparation
         "prep_remove_water": True, "prep_remove_het": True, "prep_keep_metals": True,
-        "prep_add_h": True, "prep_fix_atoms": True, "prep_fix_loops": True,
+        "prep_add_h": True, "prep_fix_atoms": False, "prep_fix_loops": False,
         "prep_propka": False, "prep_minimize": False, "prep_min_steps": 100,
         # Parallelization
         "n_jobs": max(1, (os.cpu_count() or 4) - 1), "backend": "loky",
@@ -627,23 +627,141 @@ def compute_autobox(pdb_path, ref_path, padding):
 
 
 def compute_admet(mol):
-    from rdkit.Chem import Descriptors, Lipinski, QED
+    from rdkit.Chem import Descriptors, Lipinski, QED, rdMolDescriptors, FilterCatalog
     try:
-        mw = Descriptors.ExactMolWt(mol)
+        mw   = Descriptors.ExactMolWt(mol)
         logp = Descriptors.MolLogP(mol)
         tpsa = Descriptors.TPSA(mol)
-        hbd = Lipinski.NumHDonors(mol)
-        hba = Lipinski.NumHAcceptors(mol)
-        qed = QED.qed(mol)
-        
-        # Lipinski Rule of 5 Violations
+        hbd  = Lipinski.NumHDonors(mol)
+        hba  = Lipinski.NumHAcceptors(mol)
+        qed  = QED.qed(mol)
+        rotb = rdMolDescriptors.CalcNumRotatableBonds(mol)
+        arom = rdMolDescriptors.CalcNumAromaticRings(mol)
+        fsp3 = rdMolDescriptors.CalcFractionCSP3(mol)
+        chrg = sum(a.GetFormalCharge() for a in mol.GetAtoms())
         fails = sum([mw > 500, logp > 5, hbd > 5, hba > 10])
-        return {"MW": mw, "LogP": logp, "TPSA": tpsa, "HBD": hbd, "HBA": hba, "QED": qed, "Lipinski Fails": fails}
+
+        # PAINS filter
+        pains_flag = None
+        try:
+            params = FilterCatalog.FilterCatalogParams()
+            params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS)
+            catalog = FilterCatalog.FilterCatalog(params)
+            entry = catalog.GetFirstMatch(mol)
+            if entry:
+                pains_flag = entry.GetDescription()
+        except Exception:
+            pass
+
+        # Rule-based toxicity flags
+        herg_risk    = (logp > 4.5 and mw > 450 and hba < 4)
+        bbb_ok       = (mw < 450 and 1 <= logp <= 5 and tpsa < 90 and hbd <= 3)
+        hepato_risk  = (logp > 4.0 and hbd < 2 and mw > 300)
+        mutagen_risk = bool(pains_flag) or (arom >= 3 and chrg != 0)
+
+        # Per-property traffic lights
+        def _tl(val, green, yellow):
+            if val is None: return "grey"
+            glo, ghi = green; ylo, yhi = yellow
+            if glo <= val <= ghi: return "green"
+            if ylo <= val <= yhi: return "yellow"
+            return "red"
+
+        traffic = {
+            "MW":   _tl(mw,   (0, 500),   (0, 600)),
+            "LogP": _tl(logp, (0, 5),     (-1, 6)),
+            "TPSA": _tl(tpsa, (0, 90),    (0, 140)),
+            "HBD":  _tl(hbd,  (0, 5),     (0, 7)),
+            "HBA":  _tl(hba,  (0, 10),    (0, 12)),
+            "QED":  _tl(qed,  (0.5, 1.0), (0.3, 1.0)),
+            "Fsp3": _tl(fsp3, (0.25, 1.0),(0.1, 1.0)),
+        }
+
+        return {
+            "MW": mw, "LogP": logp, "TPSA": tpsa, "HBD": hbd, "HBA": hba,
+            "QED": qed, "Lipinski Fails": fails,
+            "Rotatable Bonds": rotb, "Aromatic Rings": arom,
+            "Fsp3": fsp3, "Formal Charge": chrg,
+            "PAINS Alert": pains_flag,
+            "hERG Risk": herg_risk, "BBB Penetration": bbb_ok,
+            "Hepatotoxicity Risk": hepato_risk, "Mutagenicity Risk": mutagen_risk,
+            "_traffic": traffic,
+        }
     except Exception:
-        return {"MW": None, "LogP": None, "TPSA": None, "HBD": None, "HBA": None, "QED": None, "Lipinski Fails": None}
+        return {"MW": None, "LogP": None, "TPSA": None, "HBD": None, "HBA": None,
+                "QED": None, "Lipinski Fails": None, "_traffic": {}}
+
+
+def analyze_waters(pdb_path, box, cutoff=6.0):
+    """Classify crystallographic waters inside the docking box.
+    Returns list of {x, y, z, stable, hbond_count, dist}.
+    Stable = H-bonded to >= 2 protein polar atoms within 3.5 Å.
+    Pure-numpy approach — no NeighborSearch (avoids BioPython array shape bugs)."""
+    waters = []
+    try:
+        from Bio.PDB import PDBParser, Selection
+        import numpy as np
+        parser = PDBParser(QUIET=True)
+        struct = parser.get_structure("rec", pdb_path)
+
+        cx  = float(box.get("cx", 0)); cy  = float(box.get("cy", 0)); cz  = float(box.get("cz", 0))
+        sx  = float(box.get("sx", 20)); sy = float(box.get("sy", 20)); sz  = float(box.get("sz", 20))
+        hx, hy, hz = sx / 2 + 2, sy / 2 + 2, sz / 2 + 2
+
+        all_atoms = list(Selection.unfold_entities(struct, "A"))
+
+        # Build numpy array of polar protein atom coords (N, O, S — not from water residues)
+        polar_coords = []
+        for a in all_atoms:
+            try:
+                rname = a.get_parent().get_resname().strip()
+                if rname in ("HOH", "WAT", "SOL"): continue
+                if a.element not in ("N", "O", "S"): continue
+                c = a.get_coord()
+                polar_coords.append([float(c[0]), float(c[1]), float(c[2])])
+            except Exception:
+                continue
+        polar_arr = np.array(polar_coords) if polar_coords else np.empty((0, 3))
+
+        # Find and classify waters inside the box
+        for model in struct:
+            for chain in model:
+                for res in chain:
+                    if res.get_resname().strip() not in ("HOH", "WAT", "SOL"):
+                        continue
+                    if "O" not in res:
+                        continue
+                    try:
+                        c = res["O"].get_coord()
+                        ox, oy, oz = float(c[0]), float(c[1]), float(c[2])
+                    except Exception:
+                        continue
+                    # Box containment check
+                    if not (abs(ox - cx) <= hx and abs(oy - cy) <= hy and abs(oz - cz) <= hz):
+                        continue
+                    dist = float(np.sqrt((ox-cx)**2 + (oy-cy)**2 + (oz-cz)**2))
+                    # Count polar protein atoms within 3.5 Å (H-bond proxy)
+                    hb = 0
+                    if polar_arr.shape[0] > 0:
+                        diffs = polar_arr - np.array([ox, oy, oz])
+                        dists = np.sqrt((diffs**2).sum(axis=1))
+                        hb = int((dists <= 3.5).sum())
+                    waters.append({
+                        "x": round(ox, 3), "y": round(oy, 3), "z": round(oz, 3),
+                        "stable": hb >= 2,
+                        "hbond_count": hb,
+                        "dist": round(dist, 2),
+                    })
+    except Exception as e:
+        return [{"_error": str(e)}]
+    return waters
+
+
+
 
 
 def analyze_interactions(rec_pdb, pose_sdf, distance_cutoff=4.0):
+
     """Find receptor residues interacting with the docked ligand pose."""
     try:
         from Bio.PDB import PDBParser, NeighborSearch, Selection
@@ -805,114 +923,151 @@ def prepare_ligand(mol, name, cfg, out_dir):
 
 
 def prepare_protein(pdb_path, cfg):
-    """Full protein preparation pipeline (steps 1-7). Returns path to prepared PDB."""
+    """Tiered protein preparation pipeline. Simple steps use reliable line-filtering
+    and obabel. PDBFixer is reserved for the optional complex steps only."""
     prep_log = []
     out_path = pdb_path.replace(".pdb", "_prepared.pdb")
-    
-    # ── Steps 1-5: PDBFixer-based preparation ──
-    try:
-        from pdbfixer import PDBFixer
-        from openmm.app import PDBFile
-        
-        # Load directly from original PDB (avoid intermediate file issues)
-        fixer = PDBFixer(filename=pdb_path)
-        
-        # Step 1+2: Remove water and heteroatoms together via PDBFixer
-        if cfg.get("prep_remove_het", True) or cfg.get("prep_remove_water", True):
-            keep_water = not cfg.get("prep_remove_water", True)
-            fixer.removeHeterogens(keepWater=keep_water)
-            prep_log.append("Removed heteroatoms" + (" + water" if not keep_water else ""))
-        elif cfg.get("prep_remove_water", True):
-            fixer.removeHeterogens(keepWater=False)
+    current = pdb_path  # track working file as we apply steps
+
+    # ── Step 1: Remove water (HOH/WAT lines) ──────────────────────────────────
+    if cfg.get("prep_remove_water", True):
+        try:
+            lines = Path(current).read_text(errors="replace").splitlines()
+            kept = [l for l in lines
+                    if not (l.startswith(("HETATM", "ATOM")) and l[17:20].strip() in ("HOH","WAT","SOL"))]
+            Path(out_path).write_text("\n".join(kept) + "\n")
+            current = out_path
             prep_log.append("Removed water molecules")
-        
-        # Step 5: Find and model missing residues/loops
-        if cfg.get("prep_fix_loops", True):
-            fixer.findMissingResidues()
-            prep_log.append("Identified missing loops/residues")
-        
-        # Step 4: Fix missing atoms
-        if cfg.get("prep_fix_atoms", True):
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
-            prep_log.append("Repaired missing heavy atoms")
-        
-        # Step 3: Add hydrogens at pH
-        if cfg.get("prep_add_h", True):
+        except Exception as e:
+            prep_log.append(f"[WARN] Water removal failed: {e}")
+
+    # ── Step 2: Remove heteroatoms / co-crystallised ligands ──────────────────
+    if cfg.get("prep_remove_het", True):
+        try:
+            keep_metals = cfg.get("prep_keep_metals", True)
+            METALS = {"ZN","MG","CA","FE","MN","CU","CO","NI","NA","K","CL"}
+            lines = Path(current).read_text(errors="replace").splitlines()
+            kept = []
+            for l in lines:
+                if l.startswith("HETATM"):
+                    res = l[17:20].strip()
+                    atom = l[12:16].strip()
+                    if res in ("HOH","WAT","SOL"):
+                        kept.append(l); continue  # water already handled above
+                    if keep_metals and atom.upper() in METALS:
+                        kept.append(l); continue  # keep metal cofactors
+                    # drop this HETATM
+                else:
+                    kept.append(l)
+            Path(out_path).write_text("\n".join(kept) + "\n")
+            current = out_path
+            prep_log.append("Removed heteroatoms" + (" (kept metals)" if keep_metals else ""))
+        except Exception as e:
+            prep_log.append(f"[WARN] Heteroatom removal failed: {e}")
+
+    # ── Step 3: Add hydrogens at physiological pH via obabel ──────────────────
+    if cfg.get("prep_add_h", True):
+        try:
             ph = cfg.get("target_ph", 7.4)
-            fixer.addMissingHydrogens(ph)
-            prep_log.append(f"Added hydrogens at pH {ph}")
-        
-        # Write PDBFixer output
-        with open(out_path, "w") as f:
-            PDBFile.writeFile(fixer.topology, fixer.positions, f)
-        prep_log.append("PDBFixer preparation complete")
-        
-    except ImportError:
-        prep_log.append("[WARN] PDBFixer/OpenMM not installed — skipping steps 2-5")
-        # Manual fallback: at least strip water via line filtering
-        if cfg.get("prep_remove_water", True):
-            pdb_text = Path(pdb_path).read_text()
-            lines = [l for l in pdb_text.splitlines() if not (l.startswith(("HETATM", "ATOM")) and "HOH" in l)]
-            Path(out_path).write_text("\n".join(lines))
-            prep_log.append("Removed water molecules (manual fallback)")
-    except Exception as e:
-        prep_log.append(f"[WARN] PDBFixer error: {str(e)[:100]} — using raw PDB")
-    
-    # ── Step 6: Protonation states via propka ──
+            ob_paths = [
+                shutil.which("obabel"),
+                os.path.expanduser("~/miniconda3/envs/stratadock/bin/obabel"),
+                "/home/rajan/miniconda3/envs/stratadock/bin/obabel",
+            ]
+            ob_exe = next((p for p in ob_paths if p and Path(p).exists()), None)
+            if ob_exe:
+                h_out = out_path.replace("_prepared.pdb", "_h.pdb")
+                r = subprocess.run([ob_exe, current, "-O", h_out, "-p", str(ph)],
+                                   capture_output=True, text=True, timeout=60)
+                if Path(h_out).exists():
+                    current = h_out
+                    out_path = h_out
+                    prep_log.append(f"Added hydrogens at pH {ph} (obabel)")
+                else:
+                    prep_log.append(f"[WARN] obabel H addition produced no output: {r.stderr[:80]}")
+            else:
+                prep_log.append("[WARN] obabel not found — skipping hydrogen addition")
+        except Exception as e:
+            prep_log.append(f"[WARN] H addition failed: {e}")
+
+    # ── Steps 4+5: PDBFixer — fix missing atoms and loops (optional, complex) ──
+    if cfg.get("prep_fix_atoms", False) or cfg.get("prep_fix_loops", False):
+        try:
+            from pdbfixer import PDBFixer
+            from openmm.app import PDBFile
+            fixer = PDBFixer(filename=current)
+            if cfg.get("prep_fix_loops", False):
+                fixer.findMissingResidues()
+                prep_log.append("Identified missing loops/residues")
+            if cfg.get("prep_fix_atoms", False):
+                fixer.findMissingAtoms()
+                fixer.addMissingAtoms()
+                prep_log.append("Repaired missing heavy atoms")
+            fixer_out = out_path.replace(".pdb", "_fixed.pdb")
+            with open(fixer_out, "w") as f:
+                PDBFile.writeFile(fixer.topology, fixer.positions, f)
+            # Strip MODEL/ENDMDL records that confuse obabel
+            lines = Path(fixer_out).read_text().splitlines()
+            Path(fixer_out).write_text("\n".join(l for l in lines if not l.startswith(("MODEL","ENDMDL"))) + "\n")
+            current = fixer_out
+            out_path = fixer_out
+            prep_log.append("PDBFixer structure repair complete")
+        except ImportError:
+            prep_log.append("[WARN] PDBFixer/OpenMM not installed — skipping structure repair")
+        except Exception as e:
+            prep_log.append(f"[WARN] PDBFixer error: {str(e)[:100]} — skipping structure repair")
+
+    # ── Step 6: Protonation state analysis via propka (optional) ──────────────
     if cfg.get("prep_propka", False):
         try:
             import propka.run as propka_run
-            # propka needs a file path
-            mol_container = propka_run.single(out_path)
+            mol_container = propka_run.single(current)
             pka_info = []
             for group in mol_container.conformations["AVR"].groups:
                 if hasattr(group, "pka_value") and group.pka_value is not None:
-                    pka_info.append(f"  {group.residue_type} {group.atom.chain_id}{group.atom.res_num}: pKa={group.pka_value:.2f}")
-            if pka_info:
-                prep_log.append(f"propka3: {len(pka_info)} titratable residues analyzed")
-            else:
-                prep_log.append("propka3: No titratable residues found")
+                    pka_info.append(f"{group.residue_type}{group.atom.res_num}: pKa={group.pka_value:.2f}")
+            prep_log.append(f"propka3: {len(pka_info)} titratable residues analyzed")
         except ImportError:
             prep_log.append("[WARN] propka not installed — skipping protonation analysis")
         except Exception as e:
             prep_log.append(f"[WARN] propka error: {str(e)[:100]}")
-    
-    # ── Step 7: Energy minimization via OpenMM ──
+
+    # ── Step 7: Energy minimization via OpenMM (optional) ─────────────────────
     if cfg.get("prep_minimize", False):
         try:
             from openmm.app import PDBFile, ForceField, Modeller, Simulation
             from openmm import LangevinMiddleIntegrator, LocalEnergyMinimizer
             import openmm.unit as unit
-            
-            pdb = PDBFile(out_path)
+            pdb = PDBFile(current)
             forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
             modeller = Modeller(pdb.topology, pdb.positions)
-            
-            system = forcefield.createSystem(modeller.topology, 
-                                              nonbondedMethod=0,  # NoCutoff
-                                              constraints=None)
+            system = forcefield.createSystem(modeller.topology, nonbondedMethod=0, constraints=None)
             integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
             simulation = Simulation(modeller.topology, system, integrator)
             simulation.context.setPositions(modeller.positions)
-            
             max_steps = cfg.get("prep_min_steps", 100)
             LocalEnergyMinimizer.minimize(simulation.context, maxIterations=max_steps)
-            
             positions = simulation.context.getState(getPositions=True).getPositions()
-            with open(out_path, "w") as f:
+            min_out = current.replace(".pdb", "_min.pdb")
+            with open(min_out, "w") as f:
                 PDBFile.writeFile(simulation.topology, positions, f)
+            lines = Path(min_out).read_text().splitlines()
+            Path(min_out).write_text("\n".join(l for l in lines if not l.startswith(("MODEL","ENDMDL"))) + "\n")
+            current = min_out
             prep_log.append(f"Energy minimization complete ({max_steps} steps, Amber14)")
         except ImportError:
             prep_log.append("[WARN] OpenMM not installed — skipping minimization")
         except Exception as e:
-            prep_log.append(f"[WARN] Minimization error: {str(e)[:100]} — using unminimized structure")
-    
-    return out_path, prep_log
+            prep_log.append(f"[WARN] Minimization error: {str(e)[:100]} — skipping")
+
+    return current, prep_log
+
+
 
 
 def prepare_receptor(pdb_path, out_dir):
-    out = os.path.join(out_dir, "receptor.pdbqt")
+    basename = Path(pdb_path).stem
+    out = os.path.join(out_dir, f"{basename}.pdbqt")
     # Convert receptor to PDBQT using OpenBabel (reliable)
     
     # Fallback: use OpenBabel to prepare receptor
@@ -1125,10 +1280,26 @@ def run_single(lig_pdbqt, receptor, box, cfg, out_dir, name, term_el=None, log_l
                 if rm and rm[0]:
                     w = SDWriter(out_sdf); w.write(rm[0]); w.close()
             except Exception: out_sdf = out_pdbqt
-            en = v.energies(n_poses=1)
-            if en is not None and len(en): 
-                res["vina_score"] = float(en[0][0])
-                update_term(f"> Optimization reached. Best sequence energy: {res['vina_score']:.2f} kcal/mol")
+            # ── Extract score: parse PDBQT REMARK VINA RESULT (authoritative) ──
+            # v.energies() can return 0.0 in some vina API versions; the PDBQT
+            # REMARK line is always written correctly by vina itself.
+            try:
+                pdbqt_text = Path(out_pdbqt).read_text()
+                m_score = re.search(r"REMARK VINA RESULT:\s+([-\d.]+)", pdbqt_text)
+                if m_score:
+                    res["vina_score"] = float(m_score.group(1))
+                else:
+                    # Fallback: v.energies() column 0 = affinity
+                    en = v.energies(n_poses=1)
+                    if en is not None and len(en) and en[0][0] != 0.0:
+                        res["vina_score"] = float(en[0][0])
+            except Exception:
+                en = v.energies(n_poses=1)
+                if en is not None and len(en):
+                    res["vina_score"] = float(en[0][0])
+            if res["vina_score"] is not None:
+                update_term(f"> Optimization reached. Best Vina affinity: {res['vina_score']:.2f} kcal/mol")
+
             res["pose_sdf"] = out_sdf if Path(out_sdf).exists() else out_pdbqt
             update_term(f"> [SUCCESS] {name} docking complete.")
             
@@ -1145,7 +1316,17 @@ def batch_dock(rec_items, lig_items, boxes, cfg, out_dir, prog, status_el):
     n, backend = cfg.get("n_jobs",1), cfg.get("backend","loky")
     tasks = []
     for rname, rpdbqt, rpdb in rec_items:
-        rec_boxes = boxes.get(rname, list(boxes.values())[0] if boxes else [])
+        rec_boxes = boxes.get(rname)
+        if not rec_boxes:
+            # Try a case-insensitive / stem-only match in case keys differ slightly
+            for key, val in boxes.items():
+                if Path(key).stem.lower() == Path(rname).stem.lower():
+                    rec_boxes = val
+                    break
+        if not rec_boxes:
+            status_el.warning(f"No docking box found for **{rname}** — skipping. "
+                              f"Run 'Suggest Pocket' or 'Compute Autobox' for all receptors first.")
+            continue
         for lname, lpdbqt in lig_items:
             for box in rec_boxes:
                 tasks.append((rname, rpdbqt, rpdb, lname, lpdbqt, box))
@@ -1233,12 +1414,11 @@ def load_ligands(files):
     return mols
 
 
-def render_3d(rec_pdb, pose_sdf, view_style="Cartoon"):
+def render_3d(rec_pdb, pose_sdf, view_style="Cartoon", waters=None):
     try:
         import py3Dmol
         from stmol import showmol
         
-        # Hard override for Streamlit iframe containers to perfectly center them
         st.markdown(
             """<style>
             iframe[title="stmol.showmol"] {
@@ -1262,14 +1442,25 @@ def render_3d(rec_pdb, pose_sdf, view_style="Cartoon"):
             view.addModel(Path(pose_sdf).read_text(), "sdf")
             view.setStyle({"model":1},{"stick":{"radius":0.22,"colorscheme":"cyanCarbon"}})
             view.addSurface(py3Dmol.VDW,{"opacity":0.3,"color":"#388bfd"},{"model":1})
+
+        # HydroDock water spheres
+        if waters:
+            for w in waters:
+                color = "#22c55e" if w["stable"] else "#ef4444"
+                opacity = 0.55 if w["stable"] else 0.8
+                view.addSphere({
+                    "center": {"x": w["x"], "y": w["y"], "z": w["z"]},
+                    "radius": 0.6,
+                    "color": color,
+                    "opacity": opacity,
+                })
                 
         view.zoomTo()
         view.setBackgroundColor("#0c0f1d")
-        
-        # Free from columns; the CSS rule centers the iframe wrapper naturally
         showmol(view, height=600, width=900)
     except Exception as e:
         st.error(f"Viewer error: {e}")
+
 
 def render_box_preview(rec_bytes, boxes):
     try:
@@ -1316,12 +1507,97 @@ def render_box_preview(rec_bytes, boxes):
 # =============================================================================
 # ── PAGE 1: UPLOAD
 # =============================================================================
+@st.dialog("🧬 Fold-to-Dock — AI Structure Prediction", width="large")
+def _esm_dialog():
+    st.caption("Paste a protein sequence. ESMFold (Meta AI) predicts a 3D structure in ~10–30 s. Free, no login.")
+    _fasta_raw = st.text_area(
+        "Sequence (FASTA or plain AA)", height=120, key="esm_dlg_fasta",
+        placeholder="MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
+    )
+    _dc1, _dc2 = st.columns([2, 1])
+    with _dc1:
+        _esm_name = st.text_input("Structure name", value="predicted_structure",
+                                   key="esm_dlg_name", placeholder="Structure name…")
+    with _dc2:
+        _do_fold = st.button("🔮 Predict", key="esm_dlg_run", use_container_width=True, type="primary")
+
+    if _do_fold:
+        _seq = "".join(ln.strip() for ln in _fasta_raw.splitlines()
+                       if ln.strip() and not ln.startswith(">"))
+        if not _seq:
+            st.error("Paste a sequence first.")
+        else:
+            if len(_seq) > 600:
+                st.warning(f"{len(_seq)} AA — ESMFold works best under 400 AA, proceeding…")
+            try:
+                import requests as _req
+                with st.spinner(f"Folding {len(_seq)} AA via ESMFold API…"):
+                    _resp = _req.post(
+                        "https://api.esmatlas.com/foldSequence/v1/pdb/",
+                        data=_seq,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=120,
+                    )
+                if _resp.status_code != 200:
+                    st.error(f"ESMFold API error {_resp.status_code}: {_resp.text[:200]}")
+                else:
+                    _pdb_text = _resp.text
+                    _bfs = []
+                    for _aln in _pdb_text.splitlines():
+                        if _aln.startswith("ATOM") and len(_aln) >= 66:
+                            try: _bfs.append(float(_aln[60:66].strip()))
+                            except Exception: pass
+                    if _bfs and max(_bfs) <= 1.0:
+                        _bfs = [b * 100 for b in _bfs]
+                    _plddt = round(sum(_bfs)/len(_bfs), 1) if _bfs else None
+                    _pdb_name = (_esm_name.strip() or "predicted_structure").replace(" ", "_")
+                    if not _pdb_name.endswith(".pdb"): _pdb_name += ".pdb"
+                    st.session_state["esm_pdb_name"]  = _pdb_name
+                    st.session_state["esm_pdb_bytes"] = _pdb_text.encode()
+                    st.session_state["esm_plddt"]     = _plddt
+            except Exception as _ex:
+                st.error(f"ESMFold failed: {_ex}")
+
+    if st.session_state.get("esm_pdb_bytes"):
+        _plddt    = st.session_state.get("esm_plddt")
+        _pdb_name = st.session_state.get("esm_pdb_name", "structure.pdb")
+        if _plddt is not None:
+            _pc  = "#22c55e" if _plddt >= 70 else ("#f59e0b" if _plddt >= 50 else "#ef4444")
+            _lbl = "High" if _plddt >= 70 else ("Medium" if _plddt >= 50 else "Low")
+            _pct = min(int(_plddt), 100)
+            st.markdown(f"""
+            <div style="background:#0d0d1a;border-radius:10px;padding:12px 16px;
+                        margin-top:10px;border:1px solid {_pc}44">
+              <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+                <span style="color:#aaa;font-size:0.82rem">pLDDT Confidence · {_pdb_name}</span>
+                <span style="color:{_pc};font-weight:800">{_plddt} / 100 · {_lbl}</span>
+              </div>
+              <div style="background:#1a1a2e;border-radius:6px;height:8px;overflow:hidden">
+                <div style="background:linear-gradient(90deg,#7c3aed,{_pc});
+                            width:{_pct}%;height:100%;border-radius:6px"></div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown("")
+        if st.button("📥 Load as Receptor", key="esm_dlg_load", use_container_width=True, type="primary"):
+            _pdb_bytes = st.session_state["esm_pdb_bytes"]
+            existing = [r for r in (st.session_state.get("rec_files_data") or [])
+                        if r[0] != _pdb_name]
+            existing.append((_pdb_name, _pdb_bytes))
+            st.session_state.rec_files_data = existing
+            st.session_state.rec_bytes      = _pdb_bytes
+            st.session_state["esm_pdb_bytes"] = None
+            st.rerun()
+
+
 def page_upload():
+
     render_stepper()
     st.markdown('<div class="page-title">Upload Files</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-sub">Add your receptor and ligands to get started. All fields below are required before running docking.</div>', unsafe_allow_html=True)
 
     col_l, col_r = st.columns(2, gap="large")
+
+
 
     with col_l:
         rec_label_col, demo_col = st.columns([3, 1.5])
@@ -1341,67 +1617,155 @@ def page_upload():
                     st.session_state.rec_bytes = rec_bytes
                     st.session_state.lig_files_data = [("test_drugs.smi", lig_bytes)]
                     st.rerun()
+
+        st.caption("Select multiple files at once with Ctrl/Cmd.")
+        _rv = st.session_state.get("_rec_up_v", 0)
         rec_files = st.file_uploader("Receptor PDB(s)", type=["pdb"],
                                       accept_multiple_files=True,
-                                      label_visibility="collapsed", key="rec_up")
+                                      label_visibility="collapsed", key=f"rec_up_{_rv}")
         if rec_files:
             st.session_state.rec_files_data = [(f.name, f.read()) for f in rec_files]
-            for f in rec_files: f.seek(0)
-            # Set rec_bytes to first receptor for autobox compatibility
             st.session_state.rec_bytes = st.session_state.rec_files_data[0][1]
-            st.success(f"Loaded {len(rec_files)} receptor(s)")
         elif getattr(st.session_state, "rec_files_data", None):
-            for rname, _ in st.session_state.rec_files_data:
-                st.success(f"Loaded: {rname}")
-            if st.button("❌ Clear files", key="clear_rec"):
-                st.session_state.rec_files_data = None
-                st.session_state.rec_bytes = None
-                st.session_state.lig_files_data = []
-                st.session_state.boxes = {}
-                st.session_state.results = []
+            for idx, (rname, _) in enumerate(list(st.session_state.rec_files_data)):
+                c1, c2 = st.columns([7, 1])
+                c1.caption(rname)
+                if c2.button("x", key=f"rm_r_{idx}", use_container_width=True, help=f"Remove {rname}"):
+                    upd = [(n, b) for n, b in st.session_state.rec_files_data if n != rname]
+                    st.session_state.rec_files_data = upd or None
+                    st.session_state.rec_bytes = upd[0][1] if upd else None
+                    if not upd:
+                        st.session_state.boxes = {}; st.session_state.results = []
+                    st.session_state["_rec_up_v"] = _rv + 1
+                    st.rerun()
+            if st.button("Clear all receptors", key="clear_rec"):
+                st.session_state.rec_files_data = None; st.session_state.rec_bytes = None
+                st.session_state.boxes = {}; st.session_state.results = []
+                st.session_state["_rec_up_v"] = _rv + 1
                 st.rerun()
 
         st.markdown("")
+
         st.markdown("**Reference Ligand** *(optional)*")
         st.caption("If provided, the docking box will be centred on this ligand's position rather than the full receptor.")
         ref_file = st.file_uploader("Reference ligand SDF", type=["sdf"],
                                      label_visibility="collapsed", key="ref_up")
 
     with col_r:
-        st.markdown("**Ligands** — SDF, SMILES, or ZIP file(s)")
+        st.markdown("**Ligands** - SDF, SMILES, or ZIP file(s)")
+        st.caption("Hold Ctrl/Cmd to select multiple files at once.")
+        _lv = st.session_state.get("_lig_up_v", 0)
         lig_files = st.file_uploader("Ligand files", type=["sdf","smi","smiles","txt","zip"],
                                       accept_multiple_files=True,
-                                      label_visibility="collapsed", key="lig_up")
+                                      label_visibility="collapsed", key=f"lig_up_{_lv}")
         if lig_files:
             st.session_state.lig_files_data = [(f.name, f.read()) for f in lig_files]
-            for f in lig_files: f.seek(0)
-            st.success(f"{len(lig_files)} file(s) loaded")
-        elif getattr(st.session_state, "lig_files_data", None):
-            for lname, _ in st.session_state.lig_files_data:
-                st.success(f"Loaded: {lname}")
-            if st.button("❌ Clear ligands", key="clear_lig"):
+        elif st.session_state.get("lig_files_data"):
+            for idx, (lname, _) in enumerate(list(st.session_state.lig_files_data)):
+                c1, c2 = st.columns([7, 1])
+                c1.caption(lname)
+                if c2.button("x", key=f"rm_l_{idx}", use_container_width=True, help=f"Remove {lname}"):
+                    upd = [(n, b) for n, b in st.session_state.lig_files_data if n != lname]
+                    st.session_state.lig_files_data = upd
+                    if not upd:
+                        st.session_state.admet_data = {}; st.session_state.results = []
+                    st.session_state["_lig_up_v"] = _lv + 1
+                    st.rerun()
+            if st.button("Clear all ligands", key="clear_lig"):
                 st.session_state.lig_files_data = []
-                st.session_state.admet_data = {}
-                st.session_state.results = []
+                st.session_state.admet_data = {}; st.session_state.results = []
+                st.session_state["_lig_up_v"] = _lv + 1
                 st.rerun()
-            
-            st.markdown("")
-            if st.checkbox("👁️ Preview Ligands (2D Structure)"):
-                try:
-                    from rdkit.Chem import Draw
-                    class F:
-                        def __init__(self,n,b): self.name=n; self.b=b
-                        def read(self): return self.b
-                    prev_mols = load_ligands([F(n,b) for n,b in st.session_state.lig_files_data[:3]])[:12]
-                    if prev_mols:
-                        ms = [m for n,m in prev_mols]
-                        ns = [n[:15] for n,m in prev_mols]
-                        img = Draw.MolsToGridImage(ms, molsPerRow=4, subImgSize=(150, 150), legends=ns)
-                        st.image(img, width=460)
-                except Exception as e:
-                    st.warning(f"Could not generate 2D previews: {e}")
+
+        st.markdown("")
+        if st.session_state.get("lig_files_data") and st.checkbox("Preview Ligands (2D)", key="lig_prev_chk"):
+            try:
+                from rdkit.Chem import Draw
+                class F:
+                    def __init__(self,n,b): self.name=n; self.b=b
+                    def read(self): return self.b
+                prev_mols = load_ligands([F(n,b) for n,b in st.session_state.lig_files_data[:3]])[:12]
+                if prev_mols:
+                    ms = [m for n,m in prev_mols]
+                    ns = [n[:15] for n,m in prev_mols]
+                    img = Draw.MolsToGridImage(ms, molsPerRow=4, subImgSize=(150,150), legends=ns)
+                    st.image(img, width=460)
+            except Exception as e:
+                st.warning(f"Could not generate 2D previews: {e}")
+
+
+        # ── ESMFold card (under ligand section) ─────────────────────
+        st.markdown("")
+        st.markdown("**Fold-to-Dock** — AI structure prediction")
+        st.markdown("""
+        <div style="background:linear-gradient(135deg,#0f0c29,#302b63,#1a0533);
+                    border-radius:10px;border:1px solid #7c3aed;padding:10px 14px;
+                    box-shadow:0 0 14px #7c3aed33;
+                    display:flex;align-items:center;gap:10px">
+          <div style="font-size:1.4rem;filter:drop-shadow(0 0 6px #a78bfa)">🧬</div>
+          <div>
+            <div style="font-size:0.82rem;font-weight:800;color:#e9d5ff">
+              Fold-to-Dock
+              <span style="font-size:0.55rem;background:#7c3aed;color:#fff;
+              border-radius:3px;padding:1px 5px;vertical-align:middle;margin-left:4px">AI</span>
+            </div>
+            <div style="font-size:0.68rem;color:#a78bfa;margin-top:2px">Sequence → 3D · ESMFold · free</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <style>
+          .esm-fold-btn + div .stButton > button {
+            background: transparent !important;
+            border: 1px solid rgba(255,255,255,0.2) !important;
+            color: rgba(255,255,255,0.9) !important;
+            -webkit-text-fill-color: rgba(255,255,255,0.9) !important;
+            text-transform: none !important;
+            box-shadow: none !important;
+          }
+          .esm-fold-btn + div .stButton > button:hover {
+            background: rgba(255,255,255,0.08) !important;
+            border-color: rgba(255,255,255,0.4) !important;
+          }
+        </style>
+        <div class="esm-fold-btn"></div>
+        """, unsafe_allow_html=True)
+        if st.button("🧬 Click to Fold", key="esm_open_dlg", use_container_width=True):
+            _esm_dialog()
+
+
+
+        if st.session_state.get("esm_pdb_bytes"):
+            _ep = st.session_state.get("esm_plddt")
+            _en = st.session_state.get("esm_pdb_name", "structure.pdb")
+            if _ep is not None:
+                _ec = "#22c55e" if _ep >= 70 else ("#f59e0b" if _ep >= 50 else "#ef4444")
+                _el = "High" if _ep >= 70 else ("Medium" if _ep >= 50 else "Low")
+                st.markdown(f"""
+                <div style="background:#0d0d1a;border-radius:8px;padding:8px 12px;margin-top:6px;border:1px solid {_ec}44">
+                  <div style="display:flex;justify-content:space-between;font-size:0.75rem;margin-bottom:4px">
+                    <span style="color:#aaa">pLDDT · {_en[:20]}</span>
+                    <span style="color:{_ec};font-weight:700">{_ep} · {_el}</span>
+                  </div>
+                  <div style="background:#1a1a2e;border-radius:4px;height:6px">
+                    <div style="background:linear-gradient(90deg,#7c3aed,{_ec});width:{min(int(_ep),100)}%;height:100%;border-radius:4px"></div>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+            if st.button("📥 Load as Receptor", key="esm_card_load", use_container_width=True):
+                _eb = st.session_state["esm_pdb_bytes"]
+                _existing = [r for r in (st.session_state.get("rec_files_data") or []) if r[0] != _en]
+                _existing.append((_en, _eb))
+                st.session_state.rec_files_data = _existing
+                st.session_state.rec_bytes      = _eb
+                st.session_state["esm_pdb_bytes"] = None
+                st.rerun()
 
     st.divider()
+
+
+
+
     st.markdown("**Docking Box**")
     st.caption("The box defines the 3D search space for docking. Click below to calculate it automatically from your receptor, or set it manually in Settings.")
 
@@ -1439,15 +1803,24 @@ def page_upload():
             if not getattr(st.session_state, "rec_files_data", None):
                 st.error("Upload at least one receptor PDB first.")
             else:
-                import subprocess
-                all_boxes = {}
+                import subprocess, shutil
+                # Resolve fpocket path — works even if not in Streamlit's inherit PATH
+                fpocket_bin = (shutil.which("fpocket")
+                               or "/home/rajan/miniconda3/envs/stratadock/bin/fpocket"
+                               or "fpocket")
+                all_boxes  = {}
+                fp_errors  = []
                 max_pockets = 5 if st.session_state.multi_pocket else 1
                 for rname, rbytes in st.session_state.rec_files_data:
                     with tempfile.TemporaryDirectory() as td:
                         rp = os.path.join(td, rname)
                         Path(rp).write_bytes(rbytes)
                         try:
-                            subprocess.run(["fpocket", "-f", rp], cwd=td, capture_output=True, check=True)
+                            proc = subprocess.run(
+                                [fpocket_bin, "-f", rp], cwd=td,
+                                capture_output=True, timeout=120)
+                            if proc.returncode != 0:
+                                raise RuntimeError(proc.stderr.decode()[:300])
                             found_boxes = []
                             stem = Path(rname).stem
                             for i in range(1, max_pockets + 1):
@@ -1459,12 +1832,22 @@ def page_upload():
                             if found_boxes:
                                 all_boxes[rname] = found_boxes
                             else:
-                                st.warning(f"No pockets detected for {rname}.")
+                                fp_errors.append(f"No pockets found in top-{max_pockets} for {rname}.")
                         except Exception as e:
-                            st.error(f"fpocket failed for {rname}: {e}")
+                            fp_errors.append(f"fpocket failed for {rname}: {e}")
+                # Persist errors so they survive the rerun below
+                st.session_state["_fpocket_errors"] = fp_errors
                 if all_boxes:
                     st.session_state.boxes = all_boxes
                     st.rerun()
+                else:
+                    for msg in fp_errors:
+                        st.error(msg)
+
+
+    # Show any fpocket errors that survived the rerun
+    for _fpe in st.session_state.pop("_fpocket_errors", []):
+        st.warning(_fpe)
 
     if st.session_state.boxes:
         for rname, rboxes in st.session_state.boxes.items():
@@ -2005,7 +2388,64 @@ def build_zip_archive(results, df, engine, session_state, cfg=None):
         summary_lines.append("=" * 60)
         summary_lines.append("End of Report")
         zf.writestr("summary.txt", "\n".join(summary_lines))
-            
+
+        # 7. results.txt — clean score table
+        try:
+            import numpy as _np
+            score_col = "Vina Forcefield (kcal/mol)" if "Vina Forcefield (kcal/mol)" in df.columns else \
+                        "CNN Affinity (pKd)" if "CNN Affinity (pKd)" in df.columns else None
+            receptors_in_df = df["Receptor"].unique().tolist() if "Receptor" in df.columns else []
+
+            if score_col:
+                if len(receptors_in_df) <= 1:
+                    # ── Single receptor ──────────────────
+                    sub = df[df[score_col].notna()].copy()
+                    sub["Ligand_Name"] = sub.apply(lambda r: r.get("Ligand", r.get("name", "?")), axis=1)
+                    sub = sub[["Ligand_Name", score_col]].rename(columns={score_col: "Score"})
+                    sub = sub.sort_values("Score")
+                    
+                    sub["Score"] = sub["Score"].apply(lambda x: f"{x:.2f}")
+                    
+                    padding = 22
+                    lines = ["".join(f"{str(c):<{padding}}" for c in sub.columns)]
+                    for _, row in sub.iterrows():
+                        lines.append("".join(f"{str(row[c]):<{padding}}" for c in sub.columns))
+                    txt_content = "\n".join(lines)
+                else:
+                    # ── Multi receptor: pivot matrix + Average + SD ───────────
+                    pivot = df.pivot_table(
+                        index="Ligand", columns="Receptor",
+                        values=score_col, aggfunc="first"
+                    ).reset_index()
+                    pivot.columns.name = None
+                    rec_cols = [c for c in pivot.columns if c != "Ligand"]
+                    pivot["Average"] = pivot[rec_cols].mean(axis=1, skipna=True).round(5)
+                    # Pandas stdev crashes on single values (ddof=1). Use numpy with ddof=0.
+                    pivot["SD"] = pivot[rec_cols].apply(lambda x: _np.std(x.dropna(), ddof=0), axis=1).round(5)
+                    pivot = pivot.sort_values("Average")
+                    
+                    pivot["Average"] = pivot["Average"].apply(lambda x: f"{x:.5f}")
+                    pivot["SD"]      = pivot["SD"].apply(lambda x: f"{x:.5f}")
+                    
+                    # Replace NaN with "0.00" for better readability in the table
+                    for rc in rec_cols:
+                        pivot[rc] = pivot[rc].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "0.00")
+                        pivot = pivot.rename(columns={rc: Path(rc).stem})
+                    
+                    pivot = pivot.rename(columns={"Ligand": "Ligand_Name"})
+                    
+                    padding = 22
+                    lines = ["".join(f"{str(c):<{padding}}" for c in pivot.columns)]
+                    for _, row in pivot.iterrows():
+                        lines.append("".join(f"{str(row[c]):<{padding}}" for c in pivot.columns))
+                    txt_content = "\n".join(lines)
+                    
+                zf.writestr("results.txt", txt_content)
+        except Exception as e:
+            print(f"Error generating results.txt: {e}")
+
+
+
         # 6. Generate PyMOL Script
         if pml_recs and pml_poses:
             pml = [
@@ -2103,9 +2543,15 @@ def page_run():
             status.caption(f"Preparing receptor {rname} ({i+1}/{len(st.session_state.rec_files_data)})…")
             rp = os.path.join(work_dir, rname)
             Path(rp).write_bytes(rbytes)
+            # Store original path for HydroDock water analysis (before stripping)
+            if "orig_pdbs" not in st.session_state:
+                st.session_state.orig_pdbs = {}
+            st.session_state.orig_pdbs[rname] = rp
+
             
             # Run protein preparation pipeline (steps 1-7)
             prep_cfg = {k: v for k, v in st.session_state.items() if k.startswith("prep_") or k == "target_ph"}
+
             try:
                 prepared_pdb, prep_log = prepare_protein(rp, prep_cfg)
                 for msg in prep_log:
@@ -2299,7 +2745,10 @@ def page_results():
     z_b64 = base64.b64encode(zip_bytes).decode('utf-8') if zip_bytes else ""
     p_b64 = base64.b64encode(pdf_bytes).decode('utf-8') if pdf_bytes else ""
     
-    st.markdown(f"""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    st_md = f"""
     <style>
     .results-header-row {{
         display: flex; justify-content: flex-end; align-items: center;
@@ -2317,12 +2766,14 @@ def page_results():
     }}
     </style>
     <div class="results-header-row">
-        {"<a href='data:application/zip;base64," + z_b64 + "' download='stratadock_experiment.zip' class='dl-btn-mini'>📦 ZIP</a>" if z_b64 else ""}
-        {"<a href='data:application/pdf;base64," + p_b64 + "' download='stratadock_report.pdf' class='dl-btn-mini'>📄 PDF</a>" if p_b64 else ""}
+        {"<a href='data:application/zip;base64," + z_b64 + f"' download='stratadock_results_{ts}.zip' class='dl-btn-mini'>📦 ZIP</a>" if z_b64 else ""}
+        {"<a href='data:application/pdf;base64," + p_b64 + f"' download='stratadock_report_{ts}.pdf' class='dl-btn-mini'>📄 PDF</a>" if p_b64 else ""}
     </div>
-    """, unsafe_allow_html=True)
+    """
+    st.markdown(st_md, unsafe_allow_html=True)
 
-    res_tab1, res_tab4, res_tab5, res_tab3 = st.tabs(["📊 Docking Scores", "💊 Pharmacokinetics", "🔬 Binding Site", "🧊 3D Viewer"])
+    res_tab1, res_tab4, res_tab5, res_tab3, res_tab6 = st.tabs(["📊 Docking Scores", "💊 Pharmacokinetics", "🔬 Binding Site", "🧊 3D Viewer", "🔧 Lead Opt"])
+
 
     # Apply Dynamic Filter
     filtered_df = df[((df["Status"] == "success") & (df["Vina Forcefield (kcal/mol)"] <= vina_filter)) | (df["Status"] != "success")]
@@ -2374,31 +2825,100 @@ def page_results():
                 st.code(r["status"], language="text")
 
     with res_tab4:
-        # Show only ADMET columns
-        admet_cols = [c for c in ["Ligand", "MW", "LogP", "TPSA", "HBD", "HBA", "QED", "Lipinski Fails"] if c in sorted_df.columns]
-        if len(admet_cols) > 1:
-            admet_df = sorted_df[admet_cols].copy()
-            for col in ["MW", "LogP", "TPSA", "QED"]:
-                if col in admet_df.columns:
-                    admet_df[col] = admet_df[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
-            for col in ["HBD", "HBA", "Lipinski Fails"]:
-                if col in admet_df.columns:
-                    admet_df[col] = admet_df[col].apply(lambda x: str(int(x)) if pd.notna(x) else "—")
+        _TL = {"green": "#22c55e", "yellow": "#eab308", "red": "#ef4444", "grey": "#6b7280"}
+        _SYM = {"green": "\u2713", "yellow": "~", "red": "\u2717", "grey": "?"}
+
+        def _badge(color, label, val):
+            c, s = _TL.get(color, "#6b7280"), _SYM.get(color, "?")
+            return (f'<span style="background:{c};color:#fff;border-radius:4px;'
+                    f'padding:1px 7px;font-size:0.75rem;font-weight:700;margin-right:4px">{s}</span>'
+                    f'<span style="font-size:0.85rem">{label}: <b>{val}</b></span>')
+
+        def _risk(flag, label, good_when_true=False):
+            if flag is None: return ""
+            bad = (not flag) if good_when_true else flag
+            if bad:
+                style = "background:#ef4444;color:#fff"
+            else:
+                style = "background:#052e16;color:#4ade80;border:1px solid #16a34a"
+            return (f'<span style="{style};border-radius:4px;'
+                    f'padding:2px 8px;font-size:0.75rem;font-weight:700;margin-right:6px">{label}</span>')
+
+
+        _adm_cols = [c for c in ["Ligand", "MW", "LogP", "TPSA", "HBD", "HBA", "QED",
+                                   "Lipinski Fails", "Rotatable Bonds", "Aromatic Rings", "Fsp3"]
+                     if c in sorted_df.columns]
+        if len(_adm_cols) > 1:
+            _adf = sorted_df[_adm_cols].copy()
+            for _c in ["MW", "LogP", "TPSA", "QED", "Fsp3"]:
+                if _c in _adf.columns:
+                    _adf[_c] = _adf[_c].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "\u2014")
+            for _c in ["HBD", "HBA", "Lipinski Fails", "Rotatable Bonds", "Aromatic Rings"]:
+                if _c in _adf.columns:
+                    _adf[_c] = _adf[_c].apply(lambda x: str(int(x)) if pd.notna(x) else "\u2014")
+            st.dataframe(_adf, use_container_width=True, height=280)
+
+            st.markdown("### \U0001f9ea Molecular Profile Inspector")
+            _lig_opts_raw = [_r.get("Ligand", _r.get("name","?"))
+                             for _r in res if _r["status"] == "success"
+                             and admet_data.get(_r.get("Ligand", _r.get("name","?")))]
+            _lig_opts = list(dict.fromkeys(_lig_opts_raw))  # Deduplicate while preserving order
             
-            st.dataframe(admet_df, use_container_width=True, height=400)
-            
+            if _lig_opts:
+                _sel = st.selectbox("Select molecule to inspect", _lig_opts, key="admet_sel")
+                _ad  = admet_data.get(_sel, {})
+                _tf  = _ad.get("_traffic", {})
+                _r_match = next((_r for _r in res if _r.get("Ligand", _r.get("name")) == _sel), {})
+                _vv  = _r_match.get("vina_score")
+                _vs  = f"{_vv:.2f} kcal/mol" if _vv is not None else "\u2014"
+
+                # Build property badges row
+                _bh = "<div style='display:flex;flex-wrap:wrap;gap:8px;margin:0.8rem 0'>"
+                for _k, _lbl in [("MW","MW"),("LogP","LogP"),("TPSA","TPSA"),
+                                  ("HBD","HBD"),("HBA","HBA"),("QED","QED"),("Fsp3","Fsp3")]:
+                    _v = _ad.get(_k)
+                    _vstr = f"{_v:.2f}" if isinstance(_v, float) else str(_v if _v is not None else "\u2014")
+                    _col = _TL.get(_tf.get(_k, "grey"), "#6b7280")
+                    _sym = _SYM.get(_tf.get(_k, "grey"), "?")
+                    _bh += (f"<div style='padding:6px 14px;background:#1a1a1a;border-radius:8px;"
+                            f"border:2px solid {_col};min-width:90px;text-align:center'>"
+                            f"<div style='color:{_col};font-size:1rem;font-weight:800'>{_sym}</div>"
+                            f"<div style='font-size:0.7rem;color:#aaa;margin:1px 0'>{_lbl}</div>"
+                            f"<div style='font-size:0.9rem;font-weight:600;color:#fff'>{_vstr}</div>"
+                            f"</div>")
+                _bh += "</div>"
+                st.markdown(_bh, unsafe_allow_html=True)
+
+                # Extra descriptor metrics
+                _c1, _c2, _c3, _c4, _c5 = st.columns(5)
+                _c1.metric("Vina Score",       _vs)
+                _c2.metric("Rotatable Bonds",  _ad.get("Rotatable Bonds", "\u2014"))
+                _c3.metric("Aromatic Rings",   _ad.get("Aromatic Rings",  "\u2014"))
+                _c4.metric("Formal Charge",    _ad.get("Formal Charge",   "\u2014"))
+                _c5.metric("Lipinski Fails",   _ad.get("Lipinski Fails",  "\u2014"))
+
+                # Toxicity flags
+                st.markdown("**Toxicity / Safety Flags**")
+                _rh = "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:0.4rem 0'>"
+                _rh += _risk(_ad.get("hERG Risk"),           "hERG Risk",       good_when_true=False)
+                _rh += _risk(_ad.get("Hepatotoxicity Risk"), "Hepatotoxicity",  good_when_true=False)
+                _rh += _risk(_ad.get("Mutagenicity Risk"),   "Mutagenicity",    good_when_true=False)
+                _rh += _risk(_ad.get("BBB Penetration"),     "BBB Penetration", good_when_true=True)
+                _rh += "</div>"
+                if _ad.get("PAINS Alert"):
+                    _rh += (f'<div style="background:#7f1d1d;color:#fca5a5;border-radius:6px;'
+                            f'padding:6px 14px;font-size:0.82rem;margin-top:6px">'
+                            f'\u26a0\ufe0f PAINS: <b>{_ad["PAINS Alert"]}</b></div>')
+                st.markdown(_rh, unsafe_allow_html=True)
+
             st.caption("""
-            **Metrics Explained:** 
-            - **MW**: Molecular Weight (< 500 Da ideal). 
-            - **LogP**: Lipophilicity / fat-solubility (0–5 ideal). 
-            - **TPSA**: Topological Polar Surface Area (< 90 Å² for blood-brain barrier penetration, < 140 Å² for general oral bioavailability).
-            - **HBD**: Hydrogen Bond Donors (≤ 5 ideal).
-            - **HBA**: Hydrogen Bond Acceptors (≤ 10 ideal).
-            - **QED**: Quantitative Estimate of Drug-likeness (0.0 to 1.0, higher is more drug-like).
-            - **Lipinski Fails**: Number of Lipinski's Rule of 5 violations (0 is ideal, ≤ 1 is acceptable).
+            \U0001f7e2 Ideal  \u00b7  \U0001f7e1 Marginal  \u00b7  \U0001f534 Out of range  \u00b7
+            hERG: LogP>4.5 + MW>450  \u00b7  BBB: MW<450 + LogP 1\u20135 + TPSA<90  \u00b7  PAINS: Pan-Assay Interference
             """)
+
         else:
             st.info("ADMET calculations are available after a successful run.")
+
 
     with res_tab3:
         ok_results = [r for r in res if r["status"]=="success" and r.get("pose_sdf") and Path(r["pose_sdf"]).exists()]
@@ -2408,13 +2928,50 @@ def page_results():
                 sel_r = st.selectbox("Receptor", list({r["Receptor"] for r in ok_results}))
             with s2:
                 sel_l = st.selectbox("Ligand", [r["name"] for r in ok_results if r["Receptor"]==sel_r])
-            
-            view_style = st.radio("Protein Style", ["Cartoon","Surface","Sticks","Spheres"], horizontal=True)
-            
+
+            ctrl1, ctrl2 = st.columns([3, 1])
+            with ctrl1:
+                view_style = st.radio("Protein Style", ["Cartoon","Surface","Sticks","Spheres"], horizontal=True)
+            with ctrl2:
+                hydro_on = st.toggle("💧 HydroDock Waters", value=False, key="hydro_toggle")
+
             r_match = next((r for r in ok_results if r["Receptor"]==sel_r and r["name"]==sel_l), None)
             if r_match:
-                render_3d(r_match["rec_pdb"], r_match["pose_sdf"], view_style)
-                
+                # HydroDock water analysis
+                waters = None
+                if hydro_on:
+                    orig_pdbs = st.session_state.get("orig_pdbs", {})
+                    orig_pdb  = orig_pdbs.get(sel_r)
+                    boxes     = st.session_state.get("boxes", {})
+                    box       = next(iter(boxes.get(sel_r, list(boxes.values()) if boxes else [{}])), {})
+
+
+                    if orig_pdb and Path(orig_pdb).exists() and box:
+                        with st.spinner("Analysing crystallographic waters..."):
+                            waters = analyze_waters(orig_pdb, box)
+                        # Surface any error
+                        errors = [w["_error"] for w in (waters or []) if "_error" in w]
+                        waters = [w for w in (waters or []) if "_error" not in w]
+                        if errors:
+                            st.error(f"analyze_waters error: {errors[0]}")
+                        if waters:
+
+                            n_stable   = sum(1 for w in waters if w["stable"])
+                            n_unstable = len(waters) - n_stable
+                            wc1, wc2, wc3 = st.columns(3)
+                            wc1.metric("Waters in pocket", len(waters))
+                            wc2.metric("🟢 Stable",       n_stable,   help="H-bonded ≥2 times — risky to displace")
+                            wc3.metric("🔴 Displaceable", n_unstable, help="Weakly coordinated — ligands gain energy displacing these")
+                            if n_unstable:
+                                st.success(f"🔴 {n_unstable} displaceable water(s) found — ligands that occupy this space may gain binding affinity.")
+                        else:
+                            st.info("No crystallographic waters found inside the docking box. The PDB may have had waters removed during prep.")
+                    else:
+                        st.warning("Original PDB not available for water analysis. Run docking again to enable HydroDock.")
+
+
+                render_3d(r_match["rec_pdb"], r_match["pose_sdf"], view_style, waters=waters)
+
                 if Path(r_match["pose_sdf"]).exists():
                     dl1, dl2 = st.columns(2)
                     with dl1:
@@ -2425,6 +2982,7 @@ def page_results():
                             st.download_button("Download complex PDB", Path(cpdb).read_bytes(), f"{sel_r}_{sel_l}_complex.pdb", use_container_width=True)
         else:
             st.info("No successful 3D poses generated.")
+
 
     with res_tab5:
         ok_results_bs = [r for r in res if r["status"]=="success" and isinstance(r.get("interactions"), pd.DataFrame) and not r["interactions"].empty]
@@ -2450,6 +3008,193 @@ def page_results():
                 st.caption("Bond types are inferred from atom distances and element types. H-bonds: polar atoms < 3.5 Å. Hydrophobic: carbon-carbon contacts < 4.0 Å. Salt bridges: charged residue-polar ligand atom < 4.0 Å.")
         else:
             st.info("No binding site interaction data available. Run a docking experiment first.")
+
+    with res_tab6:
+        st.markdown("### \U0001f9ec Analog Designer")
+        st.caption("Edit the SMILES of a docked ligand, then run a fast mini-dock to compare its affinity against the original.")
+
+        ok_lo = [r for r in res if r["status"] == "success"]
+        if not ok_lo:
+            st.info("Run a docking experiment first.")
+        else:
+            lo_ligs = list({r.get("Ligand", r.get("name","?")) for r in ok_lo})
+            lo_sel  = st.selectbox("Select parent ligand", lo_ligs, key="lo_lig")
+            lo_r    = next((r for r in ok_lo if r.get("Ligand", r.get("name")) == lo_sel), None)
+
+            if lo_r:
+                orig_score = lo_r.get("vina_score")
+                orig_smiles = lo_r.get("smiles", "")
+
+                # Try to get SMILES from the pose SDF if not stored
+                if not orig_smiles and lo_r.get("pose_sdf") and Path(lo_r["pose_sdf"]).exists():
+                    try:
+                        from rdkit.Chem import SDMolSupplier, MolToSmiles
+                        _supp = SDMolSupplier(lo_r["pose_sdf"], removeHs=True)
+                        _m = next((m for m in _supp if m), None)
+                        if _m: orig_smiles = MolToSmiles(_m)
+                    except Exception:
+                        pass
+
+                # Structure preview
+                if orig_smiles:
+                    try:
+                        from rdkit.Chem import MolFromSmiles
+                        from rdkit.Chem.Draw import rdMolDraw2D
+                        import base64
+                        _pm = MolFromSmiles(orig_smiles)
+                        if _pm:
+                            _d = rdMolDraw2D.MolDraw2DSVG(300, 200)
+                            _d.drawOptions().addStereoAnnotation = True
+                            _d.DrawMolecule(_pm)
+                            _d.FinishDrawing()
+                            _svg = _d.GetDrawingText()
+                            _b64 = base64.b64encode(_svg.encode()).decode()
+                            st.markdown(
+                                f'<div style="display:flex;justify-content:center;background:#f8f8ff;'
+                                f'border-radius:10px;padding:10px;margin-bottom:8px">'
+                                f'<img src="data:image/svg+xml;base64,{_b64}" width="300"/></div>',
+                                unsafe_allow_html=True)
+                    except Exception:
+                        pass
+
+                # Quick-swap substituent buttons
+                st.markdown("**⚡ Quick Modifications** — appends fragment to current SMILES:")
+                _frags = {
+                    "-F": "F", "-Cl": "Cl", "-Br": "Br", "-OH": "O",
+                    "-CH₃": "C", "-CF₃": "C(F)(F)F", "-OCH₃": "OC",
+                    "-NH₂": "N", "-CN": "C#N", "-NO₂": "[N+](=O)[O-]",
+                }
+                # staging pattern: apply BEFORE widget renders to avoid post-render mutation error
+                if "lo_smiles_staging" in st.session_state:
+                    st.session_state["lo_smiles_box"] = st.session_state.pop("lo_smiles_staging")
+                elif "lo_smiles_box" not in st.session_state:
+                    st.session_state["lo_smiles_box"] = orig_smiles
+
+                _fcols = st.columns(len(_frags))
+                for _fc, (_flbl, _fsmi) in zip(_fcols, _frags.items()):
+                    if _fc.button(_flbl, key=f"frag_{_flbl}", use_container_width=True):
+                        st.session_state["lo_smiles_staging"] = st.session_state.get("lo_smiles_box", orig_smiles) + f".{_fsmi}"
+                        st.rerun()
+
+                # SMILES editor
+                analog_smiles = st.text_area(
+                    "Analog SMILES (edit freely)",
+                    height=80, key="lo_smiles_box",
+                    help="Modify the SMILES to design your analog. Must be a valid RDKit SMILES."
+                )
+                if st.button("\U0001f4a1 Reset to original", key="lo_reset"):
+                    st.session_state["lo_smiles_staging"] = orig_smiles
+                    st.rerun()
+
+
+                # Validate
+                analog_mol = None
+                try:
+                    from rdkit.Chem import MolFromSmiles
+                    analog_mol = MolFromSmiles(analog_smiles)
+                    if analog_mol:
+                        st.success(f"Valid SMILES \u2713  ({analog_mol.GetNumAtoms()} heavy atoms)")
+                    else:
+                        st.error("Invalid SMILES — check syntax.")
+                except Exception as ex:
+                    st.error(f"SMILES parse error: {ex}")
+
+                # Mini-dock button
+                if analog_mol and st.button("\U0001f680 Dock Analog (fast)", type="primary", use_container_width=True, key="lo_dock"):
+                    try:
+                        import tempfile, subprocess
+                        from rdkit.Chem import AllChem, MolToMolBlock
+                        from rdkit.Chem import AddHs
+
+                        with st.spinner("Preparing analog & running mini-dock..."):
+                            # Sanitize: keep only the largest fragment
+                            # (disconnected SMILES like 'Aspirin.F' crash Vina PDBQT parser)
+                            from rdkit.Chem import rdmolops, MolToSmiles
+                            _frags_mol = rdmolops.GetMolFrags(analog_mol, asMols=True)
+                            if len(_frags_mol) > 1:
+                                analog_mol = max(_frags_mol, key=lambda m: m.GetNumHeavyAtoms())
+                                st.warning(f"Disconnected SMILES detected — keeping largest fragment "
+                                           f"({analog_mol.GetNumHeavyAtoms()} heavy atoms) for docking. "
+                                           f"Edit the SMILES directly to fuse substituents into the scaffold.")
+
+                            # 3D embed
+                            _am = AddHs(analog_mol)
+                            AllChem.EmbedMolecule(_am, AllChem.ETKDGv3())
+                            AllChem.MMFFOptimizeMolecule(_am)
+                            _td = tempfile.mkdtemp(prefix="lo_")
+                            _sdf_in  = os.path.join(_td, "analog.sdf")
+                            _pdbqt_l = os.path.join(_td, "analog.pdbqt")
+                            with open(_sdf_in, "w") as _f: _f.write(MolToMolBlock(_am))
+
+
+                            # SDF → PDBQT via obabel
+                            _ob_paths = [
+                                shutil.which("obabel"),
+                                "/home/rajan/miniconda3/envs/stratadock/bin/obabel",
+                            ]
+                            _ob = next((p for p in _ob_paths if p and Path(p).exists()), None)
+                            if not _ob: raise RuntimeError("obabel not found")
+                            subprocess.run([_ob, _sdf_in, "-O", _pdbqt_l, "--gen3d"],
+                                           capture_output=True, timeout=30)
+                            if not Path(_pdbqt_l).exists():
+                                raise RuntimeError("obabel ligand conversion failed")
+
+                            # Derive receptor PDBQT from rec_pdb's work directory
+                            _work_dir  = os.path.dirname(lo_r.get("rec_pdb", ""))
+                            _rec_pdbqt = os.path.join(_work_dir, "receptor.pdbqt") if _work_dir else None
+                            if not _rec_pdbqt or not Path(_rec_pdbqt).exists():
+                                raise RuntimeError(f"Receptor PDBQT not found at: {_rec_pdbqt}")
+                            _boxes = st.session_state.get("boxes", {})
+                            _box   = next(iter(_boxes.get(lo_r.get("Receptor",""), list(_boxes.values()) if _boxes else [{}])), {})
+                            if not _box:
+                                raise RuntimeError("Docking box not found in session state.")
+
+
+                            # Run Vina
+                            from vina import Vina
+                            _v = Vina(sf_name="vina", verbosity=0)
+                            _v.set_receptor(_rec_pdbqt)
+                            _v.set_ligand_from_file(_pdbqt_l)
+                            _v.compute_vina_maps(
+                                center=[_box["cx"], _box["cy"], _box["cz"]],
+                                box_size=[_box["sx"], _box["sy"], _box["sz"]]
+                            )
+                            _v.dock(exhaustiveness=4, n_poses=1)
+                            _out = os.path.join(_td, "out.pdbqt")
+                            _v.write_poses(_out, n_poses=1, overwrite=True)
+
+                            # Parse score
+                            _ascore = None
+                            if Path(_out).exists():
+                                for _ln in Path(_out).read_text().splitlines():
+                                    if "REMARK VINA RESULT" in _ln:
+                                        try: _ascore = float(_ln.split()[3]); break
+                                        except Exception: pass
+                            if _ascore is None:
+                                _e = _v.energies(n_poses=1)
+                                if _e and _e[0][0] != 0.0: _ascore = _e[0][0]
+
+                        # Show comparison
+                        _cc1, _cc2, _cc3 = st.columns(3)
+
+                        _cc1.metric("Original (" + lo_sel + ")",
+                                    f"{orig_score:.2f} kcal/mol" if orig_score else "—")
+                        _cc2.metric("Analog affinity",
+                                    f"{_ascore:.2f} kcal/mol" if _ascore else "—")
+                        _delta = (_ascore - orig_score) if (_ascore and orig_score) else None
+                        _cc3.metric("ΔAffinity",
+                                    f"{_delta:+.2f} kcal/mol" if _delta is not None else "—",
+                                    delta=f"{_delta:+.2f}" if _delta is not None else None,
+                                    delta_color="inverse")
+                        if _delta and _delta < 0:
+                            st.success(f"\U0001f31f Analog is **{abs(_delta):.2f} kcal/mol stronger** than the parent!")
+                        elif _delta and _delta > 0:
+                            st.warning(f"\U0001f4c9 Analog is **{_delta:.2f} kcal/mol weaker** — try a different modification.")
+
+                    except Exception as _ex:
+                        st.error(f"Mini-dock failed: {_ex}")
+
+
     
     # ── Re-run option ──
     st.markdown("")
@@ -2470,34 +3215,178 @@ def page_results():
 def page_help():
     render_stepper()
     st.markdown('<div class="page-title">Help &amp; Documentation</div>', unsafe_allow_html=True)
-    st.markdown('<div class="page-sub">Learn how to use StrataDock and interpret advanced computational outputs.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-sub">Learn how to use StrataDock and interpret its advanced computational outputs.</div>', unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🚀 Quick Start", "🧠 GNINA AI & Scoring", "🧬 Advanced Features (Flex)", "❓ FAQ", "💾 Save/Load Project"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🚀 Quick Start", "🧠 GNINA AI & Scoring", "⚙️ Features & Pipeline",
+        "❓ FAQ", "💾 Save/Load Project"
+    ])
+
+
+    with tab1:
+        st.markdown("""
+### 🚀 How to run a docking job
+
+**Step 1 — Upload**
+- Upload your **receptor(s)** as `.pdb` files, OR use **🧬 Fold-to-Dock** (right column) to predict a 3D structure directly from a protein sequence — no PDB file needed.
+- Upload your **ligand(s)** as `.sdf` (3D structures) or `.smi` / `.txt` (SMILES strings).
+- **Defining the Docking Box:**
+    - **Option A:** Upload a Reference Ligand and click **Compute Autobox** — the box centers on the ligand.
+    - **Option B:** Click **Suggest Pockets (Auto)** — StrataDock runs geometric cavity detection (FPocket-inspired) to find the most druggable binding sites and snaps boxes around them automatically.
+
+**Step 2 — Settings**
+- Choose your **docking engine**: AutoDock Vina (CPU, recommended) or GNINA (CNN-based, GPU-accelerated).
+- Configure **Protein Preparation** — StrataDock can automatically:
+    - Remove water molecules and heteroatoms from crystal structures
+    - Add missing hydrogen atoms at physiological pH
+    - Repair missing atoms and model missing loops (PDBFixer)
+    - Assign protonation states via propka
+    - Run energy minimization via OpenMM Amber14
+- Adjust molecular parameters. **Default values are optimized for high-throughput screening.**
+
+**Step 3 — Run & Results**
+- Click **Run Docking**. The cinematic console streams engine logs in real-time.
+- Protein preparation runs automatically before docking.
+- For bulk / N × M cross-docking, use **Parallelization** settings to distribute across CPU cores.
+- After running, results appear across **5 tabs**:
+    - 📊 **Docking Scores** — ranked poses, affinity table, downloadable poses
+    - 💊 **ADMET** — pharmacokinetics and drug-likeness prediction
+    - 🧫 **Binding Site** — interacting residues and contact map
+    - 💧 **3D Viewer** — interactive 3D view with HydroDock water analysis overlay
+    - 🔧 **Lead Opt** — R-group analog generator and mini-dock workbench
+- Download the **ZIP archive** — organized by receptor with poses, complex PDBs, interaction CSVs, and `summary.txt`.
+        """)
+
+    with tab2:
+        st.markdown("### Understanding the scores")
+        st.warning("**Crucial Note:** GNINA outputs completely different metrics than standard AutoDock. Do not mix them up!")
+
+        st.markdown("""
+**Vina Forcefield** *(kcal/mol)*
+> The estimated binding free energy from the empirical physics engine.
+> **More negative = stronger binding.** A score below −7 kcal/mol is generally a good binder.
+> *Note: If Flexible Docking is enabled, this score may go positive due to deformation penalties — trust CNN Pose Probability instead.*
+
+**CNN Pose Probability** *(GNINA only)*
+> A 0–1 probability from GNINA's convolutional neural network estimating how likely a pose represents a **true biological binding mode**.
+> **Above 0.5 = highly confident.** This score is often more meaningful than Vina for flexible docking.
+
+**CNN Affinity** *(GNINA only)*
+> The CNN's empirical prediction of binding affinity (pKd). **Higher is better.**
+
+**pLDDT Score** *(Fold-to-Dock)*
+> Per-residue confidence from ESMFold. Range 0–100. ≥70 = high confidence (reliable structure), 50–70 = medium, <50 = low (disordered region).
+        """)
+
+    with tab3:
+        st.markdown("### ⚙️ Features & Pipeline")
+        st.markdown("""
+#### 🧬 Fold-to-Dock — AI Structure Prediction
+Located on the **Upload page** (right column). Click **🧬 Click to Fold** to open the dialog.
+- Paste any protein sequence → ESMFold (Meta AI) predicts a 3D structure in ~10–30 s, for free
+- The **pLDDT bar** shows per-residue confidence (≥70 = high, 50–70 = medium, <50 = disordered)
+- Click **📥 Load as Receptor** to inject into the pipeline. Works best under 400 AA.
+- *Example:* `LSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLS` (Villin HP36, should score ~90)
+
+---
+
+#### 💊 ADMET — Pharmacokinetics & Drug-likeness
+Available in **Results → Pharmacokinetics** tab. Computes Lipinski Rule of 5, TPSA, LogP, HBD/HBA, MW, rotatable bonds via RDKit/SwissADME. Color-coded pass/fail helps prioritize orally bioavailable candidates.
+
+---
+
+#### 💧 HydroDock — Binding Site Water Analysis
+Available in **Results → 3D Viewer** — toggle **Show HydroDock Waters**.
+- Classifies waters as **Stable** (structural H-bonds, blue spheres) or **Displaceable** (loose, orange spheres)
+- Displacing unstable waters with ligand substituents is a classic affinity-boosting strategy
+
+---
+
+#### 🔧 Lead Optimization R-Group Workbench
+Available in **Results → Lead Opt** after docking.
+1. Select a ligand → view its 2D structure
+2. Edit SMILES or click **Quick Mod** buttons (─F, ─CH₃, ─OH, ─NH₂, ─CF₃)
+3. **Run Mini-Dock** — fast Vina job (exhaustiveness=4) on the analog
+4. Side-by-side **Δ affinity comparison** vs. the original
+
+*Tips: F improves metabolic stability · CH₃ adds steric selectivity · OH creates new H-bonds*
+
+---
+
+#### 🧫 Binding Site Analysis
+Available in **Results → Binding Site**. Lists all residues within contact distance of each pose, annotated with interaction type (H-bond, hydrophobic, charged). Use to understand your SAR.
+
+---
+
+#### 🔩 Receptor Flexibility (`--flexdist`)
+Enabling **Flexible Docking** unfreezes side-chains within 3.5 Å of the pocket for induced-fit simulation.
+> ⚠️ With flexdist on, Vina scores often go positive due to deformation penalties — always use **CNN Pose Probability** as the primary metric instead.
+
+---
+
+#### 🤖 CNN Modes *(GNINA only)*
+- **none** — pure Vina (fast)
+- **rescore** — Vina poses, CNN grading (default)
+- **refinement** — CNN steers pose search (slow, most accurate)
+
+---
+
+#### 🏗️ Protein Preparation Pipeline
+Runs automatically before every dock: remove water/HETATM → add H at pH 7 → repair atoms/loops (PDBFixer) → propka protonation → OpenMM Amber14 minimization.
+        """)
+
+    with tab4:
+        faqs = [
+            ("My ligand failed preparation — what do I do?",
+             "Some molecules cannot be embedded in 3D by RDKit (e.g. complex metal complexes, unusual valences). Try increasing 'Max embedding attempts' in Settings, or check that your SMILES/SDF is valid. You can validate SMILES at rdkit.org."),
+            ("What is a good Vina score?",
+             "Below −6 kcal/mol is a weak binder, −7 to −9 is moderate, and below −9 is strong. These are rough guidelines — always compare within your own screening set. (Does not apply to flexible docking with flexdist enabled.)"),
+            ("How does the 'Suggest Pocket (Auto)' feature work?",
+             "StrataDock runs a geometric cavity-detection algorithm based on fpocket principles. It constructs an alpha-shape of the receptor, maps deep crevices using Voronoi vertices, filters by hydrophobicity and volume, and auto-selects the largest, most druggable pockets."),
+            ("Why does GNINA not work on my machine?",
+             "GNINA is GPU-accelerated. It can fall back to CPU (very slow). If you don't have an NVIDIA GPU, set CNN Mode to `none` to use pure Vina scoring which is significantly faster."),
+            ("How do I run on an NVIDIA server?",
+             "Run `bash setup.sh` on the server. StrataDock auto-detects NVIDIA GPUs and enables GNINA automatically."),
+            ("What does a low pLDDT score mean for Fold-to-Dock?",
+             "pLDDT < 50 means ESMFold has low confidence — the region is likely intrinsically disordered and won't produce reliable docking results. Use well-folded proteins (enzymes, kinases, receptors typically score ≥ 70)."),
+            ("When should I use HydroDock?",
+             "HydroDock is most useful when your receptor PDB contains crystallographic waters (e.g. from RCSB PDB structures). It identifies displaceable waters — positions ideal for new ligand substituents to improve affinity."),
+            ("Can I use Lead Opt without running a full dock first?",
+             "No — Lead Opt requires a completed docking result to extract the ligand pose and box. Run at least one docking job first."),
+        ]
+        faq_html = ""
+        for q, a in faqs:
+            faq_html += f"""
+            <details class="faq-item">
+                <summary>{q}</summary>
+                <div class="faq-body">{a}</div>
+            </details>"""
+        st.markdown(faq_html, unsafe_allow_html=True)
 
     with tab5:
         st.markdown("### 💾 Manage Project Session")
         st.caption("Save your progress, uploaded proteins, and tuning settings to a file, or resume a previous docking project.")
-        
+
         export_keys = [
             "engine", "boxes", "rec_files_data", "lig_files_data", "box_padding", "multi_pocket",
-            "embed_method", "max_attempts", "force_field", "ff_steps", "add_hs", 
-            "keep_chirality", "merge_nphs", "hydrate", "exhaustiveness", "num_poses", 
+            "embed_method", "max_attempts", "force_field", "ff_steps", "add_hs",
+            "keep_chirality", "merge_nphs", "hydrate", "exhaustiveness", "num_poses",
             "cnn_model", "cnn_weight", "min_rmsd", "gnina_seed", "gpu_device", "flexdist", "cnn_mode",
-            "v_exhaustiveness", "v_num_poses", "energy_range", "scoring_fn", "vina_seed", 
+            "v_exhaustiveness", "v_num_poses", "energy_range", "scoring_fn", "vina_seed",
             "n_jobs", "backend",
             "prep_remove_water", "prep_remove_het", "prep_keep_metals", "prep_add_h",
             "prep_fix_atoms", "prep_fix_loops", "prep_propka", "prep_minimize", "prep_min_steps"
         ]
         export_state = {k: st.session_state[k] for k in export_keys if k in st.session_state}
-        
+
         col_exp, col_imp = st.columns(2, gap="large")
-        
+
         with col_exp:
             st.markdown("**Export Current Session**")
             import pickle, base64
             b64_str = base64.b64encode(pickle.dumps(export_state)).decode("utf-8")
-            st.download_button("📥 Click here to download (.stratadock)", b64_str, "project.stratadock", use_container_width=True)
-            
+            st.download_button("📥 Click here to download (.stratadock)", b64_str, "project.stratadock", use_container_width=True, key="help_dl_btn")
+
         with col_imp:
             st.markdown("**Restore Previous Session**")
             uploaded = st.file_uploader("Upload .stratadock session file", type=["stratadock"], label_visibility="collapsed")
@@ -2513,93 +3402,6 @@ def page_help():
                     except Exception as e:
                         st.error(f"Failed to load: {e}")
 
-    with tab1:
-        st.markdown("""
-### 🚀 How to run a docking job
-
-**Step 1 — Upload**
-- Upload your **receptor(s)** as `.pdb` files. 
-- Upload your **ligand(s)** as `.sdf` (3D structures) or `.smi` / `.txt` (1D SMILES strings).
-- **Defining the Box:** You must specify where the docking engine should search.
-    - **Option A:** Upload a Reference Ligand and click **Compute Autobox**.
-    - **Option B [NEW]:** Click **Suggest Pockets (Auto)**. StrataDock will run a pocket-detection algorithm (FPocket-inspired) to scan the receptor for the largest, deepest binding cavities and automatically snap 3D grid boxes around them!
-
-**Step 2 — Settings**
-- Choose your **docking engine**. AutoDock Vina is recommended for most users and works on all CPUs. GNINA utilizes neural-network scoring and works best with an NVIDIA/AMD GPU.
-- Configure **Protein Preparation** — StrataDock can automatically:
-    - Remove water molecules and heteroatoms from crystal structures
-    - Add missing hydrogen atoms at physiological pH
-    - Repair missing atoms and model missing loops (PDBFixer)
-    - Assign protonation states via propka (advanced)
-    - Run energy minimization via OpenMM Amber14 (advanced)
-- Adjust molecular parameters if needed. **The default values are optimized for high-throughput screening.**
-
-**Step 3 — Run & Results**
-- Click **Run Docking**. The cinematic console will stream engine logs in real-time.
-- Protein preparation runs automatically before docking (based on your settings).
-- For bulk / N × M cross-docking (multiple receptors × multiple ligands), utilize the **Parallelization** settings to unleash your CPU cores.
-- After running, view results across 4 tabs: **Docking Scores**, **Pharmacokinetics**, **Binding Site** (interacting residues), and **3D Viewer** (with complex PDB download).
-- Download the **ZIP archive** — organized by receptor with poses, complex PDBs, interaction CSVs, and a comprehensive `summary.txt`.
-        """)
-
-    with tab2:
-        st.markdown("### Understanding the scores")
-        st.warning("**Crucial Note:** GNINA outputs completely different metrics than standard AutoDock. Do not mix them up!")
-
-        st.markdown("""
-**Vina Forcefield** *(kcal/mol)*
-> The estimated binding free energy from the traditional empirical physics engine.
-> **More negative = stronger binding.** A score below −7 kcal/mol is generally considered a good binder.
-> *Note: If you enable Flexible Docking, this score may become positive due to deformation penalties (see the Advanced Features tab).*
-
-**CNN Pose Probability** *(GNINA only)*
-> A probability score from GNINA's convolutional neural network that estimates how likely a pose represents a **true biological binding pose**.
-> **Range: 0.0 to 1.0 (Higher is objectively better).** A Probability above 0.5 is generally considered a highly confident binding pose regardless of what the Vina Forcefield score says.
-
-**CNN Affinity** *(GNINA only)*
-> The CNN's prediction of binding affinity (pKd).
-> **Higher is better.** (Note: This is an empirical constant, not a kcal/mol energy).
-        """)
-
-    with tab3:
-        st.markdown("### 🧬 Advanced Features & Flexibility")
-        st.markdown("""
-#### 1. Automated Receptor Flexibility (`--flexdist`)
-By default, docking engines assume the target protein is entirely frozen. This is fast but biologically inaccurate. Turning on **Flexible Docking** in the settings fundamentally changes the calculation.
-- GNINA will detect any of the protein's native amino acid side-chains that are within **3.5 Angstroms** of the pocket center.
-- It will then temporarily "unfreeze" those atoms, allowing physical rotation and bending during the simulation to dynamically warp around your drug (Induced Fit).
-
-**Why is my Vina Forcefield score positive when Flexible Docking is on?**
-When you bend a physical protein out of its native relaxed state, the physics engine assigns a massive "Deformation Penalty" for steric clashing and torsional strain inside the receptor itself. Therefore, a perfectly placed ligand might generate an empirically terrible Vina score (e.g. `+1.85`). If you use Flexible Docking, **always trust the CNN Pose Probability instead of the Vina score!**
-
-#### 2. Deep Learning Energy Minimization (CNN Modes)
-GNINA has two brains: a fast physics equation (Vina) and a slow Deep Learning Neural Network (CNN).
-- **none:** Completely bypass the Neural Network. Runs identically to classic AutoDock Vina.
-- **rescore (Default):** Runs the fast Vina physics to generate the poses, and then simply asks the Neural Network to grade the final answers as a probability.
-- **refinement:** Extremely slow but incredibly accurate. The Neural Network actively overrides the physics engine *during* the molecular relaxation phase, dynamically pulling the ligand into the most perfect biological pose. 
-        """)
-
-    with tab4:
-        faqs = [
-            ("My ligand failed preparation — what do I do?",
-             "Some molecules cannot be embedded in 3D by RDKit (e.g. complex metal complexes, unusual valences). Try increasing 'Max embedding attempts' in Settings, or check that your SMILES/SDF is valid. You can validate SMILES at rdkit.org."),
-            ("What is a good Vina score?",
-             "Below −6 kcal/mol is considered a weak binder, −7 to −9 is a moderate binder, and below −9 is a strong binder. These are rough guidelines — always compare within your own screening set. (This only applies to rigid docking without flexdist)."),
-            ("How does the 'Suggest Pocket (Auto)' feature work?",
-             "When you click Suggest Pockets, StrataDock runs a custom geometric cavity-detection algorithm based on principles from `fpocket`. It constructs an alpha-shape of the receptor, maps out deep crevices using Voronoi vertices, filters them by hydrophobicity and volume, and automatically selects the largest, most druggable pockets as your target docking sites!"),
-            ("Why does GNINA not work on my machine?",
-             "GNINA relies heavily on massive convolutions. It can run on a CPU (using the CPU Fallback mode), but it is aggressively slow. If you don't have an NVIDIA GPU, set CNN Mode to `none` to speed things up!"),
-            ("How do I run on an NVIDIA server?",
-             "Run `bash setup.sh` on the server. StrataDock auto-detects NVIDIA GPUs and enables GNINA automatically. No manual configuration needed!"),
-        ]
-        faq_html = ""
-        for q, a in faqs:
-            faq_html += f"""
-            <details class="faq-item">
-                <summary>{q}</summary>
-                <div class="faq-body">{a}</div>
-            </details>"""
-        st.markdown(faq_html, unsafe_allow_html=True)
 
 
 # =============================================================================

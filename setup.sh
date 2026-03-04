@@ -123,7 +123,8 @@ info "Installing pure Python packages via Pip..."
     ipython_genutils \
     plotly \
     fpdf2 \
-    propka
+    propka \
+    requests
 
 success "All Python packages installed"
 
