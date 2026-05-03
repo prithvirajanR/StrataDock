@@ -1,50 +1,33 @@
-# StrataDock v 1.6.01
+# StrataDock
 
-StrataDock is a Linux-first molecular docking workstation for receptor-ligand screening. It wraps receptor preparation, ligand preparation, binding-site selection, AutoDock Vina docking, optional GNINA CPU/CUDA docking, interaction extraction, ADMET-style ligand profiling, 3D viewing, reporting, validation, and session export into one reproducible workflow.
+<p align="center">
+  <b>A Linux-first molecular docking workstation for fast, reproducible receptor-ligand screening.</b>
+</p>
 
-This repository is the clean modular rebuild. The older one-file StrataDock prototype has been replaced by a package-oriented layout with tests and a one-command Ubuntu/WSL setup path.
+<p align="center">
+  <a href="https://github.com/prithvirajanR/StrataDock"><img alt="Repo" src="https://img.shields.io/badge/GitHub-StrataDock-111111?style=for-the-badge&logo=github"></a>
+  <img alt="Version" src="https://img.shields.io/badge/version-v%201.6.01-ff4d5a?style=for-the-badge">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Ubuntu%20%7C%20WSL2-2b2b2b?style=for-the-badge&logo=ubuntu">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-222222?style=for-the-badge&logo=python">
+</p>
 
-## What StrataDock Does
+<p align="center">
+  <a href="#quick-start">Quick Start</a>
+  ·
+  <a href="#workflow">Workflow</a>
+  ·
+  <a href="#features">Features</a>
+  ·
+  <a href="#validation">Validation</a>
+  ·
+  <a href="#deep-dive">Deep Dive</a>
+</p>
 
-StrataDock is designed for users who usually have:
+---
 
-- one or more protein receptor `.pdb` files
-- one ligand file, such as `.sdf`, `.smi`, `.txt`, or a `.zip` containing ligand files
-- sometimes a known reference ligand, but often no reference ligand at all
+StrataDock turns protein and ligand files into ranked docking results with preparation, pocket detection, Vina/GNINA docking, ADMET-style profiling, 3D viewing, reports, and session exports in one repeatable flow.
 
-The app can:
-
-- prepare protein receptors for docking
-- prepare ligands from SDF or SMILES-like inputs
-- define docking boxes from a reference ligand, manual coordinates, or fpocket-predicted binding pockets
-- dock one ligand, a ligand library, or one ligand/library across multiple receptors
-- run AutoDock Vina by default
-- run GNINA in CPU mode, with NVIDIA CUDA support when available
-- keep AMD GPU machines on supported CPU paths, because official GNINA GPU acceleration is CUDA/NVIDIA-based
-- score, rank, filter, and visualize docking results
-- generate CSV, JSON, HTML, PDF, PyMOL, 3Dmol, and full-session ZIP artifacts
-- run bundled validation cases to check whether the installation behaves sanely
-
-## Current Version
-
-`v 1.6.01`
-
-Python package version: `1.6.1`
-
-## Supported Platforms
-
-Primary target:
-
-- Ubuntu Linux
-- WSL2 Ubuntu on Windows
-
-Known-good style of use:
-
-- clone or copy the repo into a Linux-native path such as `~/StrataDock`
-- run `bash setup_ubuntu.sh`
-- start with `bash run_stratadock.sh`
-
-Windows is not the primary runtime target. The app may be edited from Windows, but docking and setup are expected to run in Ubuntu/WSL.
+It is built for the normal messy case: a user has receptor `.pdb` files and ligand files, but often no reference ligand or polished docking setup.
 
 ## Quick Start
 
@@ -55,471 +38,97 @@ bash setup_ubuntu.sh
 bash run_stratadock.sh
 ```
 
-Then open:
+Open:
 
 ```text
 http://localhost:8502
 ```
 
-If `localhost` has browser weirdness on Windows/WSL, try:
+If WSL/browser routing acts weird, use:
 
 ```text
 http://127.0.0.1:8502
 ```
 
-## One-Command Setup
+## What You Get
 
-The installer is intentionally boring and direct:
+| Area | What StrataDock Handles |
+| --- | --- |
+| Receptors | PDB cleanup, water/hetero handling, receptor reports, PDBQT prep |
+| Ligands | SDF, SMILES/TXT, ZIP libraries, 3D embedding, salts/protonation options, PDBQT prep |
+| Binding sites | Reference ligand boxes, manual boxes, fpocket predicted pockets |
+| Docking | AutoDock Vina by default, GNINA CPU/CUDA optional |
+| Results | Scores, warnings, ADMET-style profile, binding-site summary, 3D viewer |
+| Exports | CSV, JSON, HTML, PDF, PyMOL, 3Dmol viewer HTML, full session ZIP |
+| Validation | Bundled redocking cases and setup smoke tests |
 
-```bash
-bash setup_ubuntu.sh
+## Workflow
+
+```mermaid
+flowchart LR
+    A["Upload receptor and ligands"] --> B["Choose engine and site"]
+    B --> C["Prepare receptor"]
+    C --> D["Prepare ligands"]
+    D --> E["Dock with Vina or GNINA"]
+    E --> F["Rank and flag results"]
+    F --> G["View, export, validate"]
 ```
 
-It performs these steps:
-
-1. Installs system packages through `apt-get` when available.
-2. Creates or repairs a Linux `.venv`.
-3. Installs or builds fpocket.
-4. Installs the Python package in editable mode.
-5. Downloads bundled validation data.
-6. Downloads AutoDock Vina.
-7. Downloads GNINA.
-8. Runs a Vina validation case.
-9. Runs a GNINA CPU smoke test.
-10. Writes `run_stratadock.sh`.
-
-The setup script is meant to handle most of the annoying parts for a normal Ubuntu/WSL user. If `apt` is busy because Ubuntu unattended upgrades are running, the script waits for the package manager lock instead of telling you to delete lock files.
-
-## Launching The App
-
-After setup:
-
-```bash
-bash run_stratadock.sh
-```
-
-The launcher activates `.venv`, puts `.venv/bin` on `PATH`, and starts Streamlit on port `8502`.
-
-To use another port:
-
-```bash
-STRATADOCK_PORT=8503 bash setup_ubuntu.sh
-bash run_stratadock.sh
-```
-
-or edit the generated launcher.
-
-## App Workflow
-
-The Streamlit app is organized around the same flow as the original StrataDock UI:
-
-1. Upload
-2. Settings
-3. Run
-4. Results
-5. Help
-
-### Upload
-
-Upload one or more receptor PDB files and one ligand input.
-
-Supported receptor input:
-
-- `.pdb`
-
-Supported ligand inputs:
-
-- `.sdf`
-- `.smi`
-- `.smiles`
-- `.txt`
-- `.zip` containing supported ligand files
-
-Multiple SDF files should be placed in a `.zip` if the browser uploader or workflow needs a single ligand archive.
-
-### Settings
-
-Choose:
-
-- docking engine
-- binding-site mode
-- receptor preparation options
-- ligand preparation options
-- docking parameters
-- run parallelism
-
-Docking engines:
-
-- AutoDock Vina
-- GNINA
-
-Binding-site modes:
-
-- Reference ligand box
-- fpocket suggested pockets
-- Manual box coordinates
-
-### Run
-
-The app creates a clean run folder, prepares inputs, resolves docking boxes, runs docking jobs, extracts interactions, builds visualizations, and writes reports.
-
-The live terminal shows progress events while the run is executing.
-
-### Results
-
-Results include:
-
-- docking score table
-- ADMET/pharmacokinetic-style ligand profile
-- binding-site/pocket view
-- 3D viewer
-- downloads
-
-### Help
-
-The Help page includes workflow notes and environment diagnostics.
-
-## Docking Engines
-
-### AutoDock Vina
-
-Vina is the default engine. It is CPU-safe, robust, and works on normal Linux/WSL machines.
-
-Important settings:
-
-- `exhaustiveness`
-- `num_modes`
-- `energy_range`
-- `seed`
-- `scoring`
-
-For quick smoke testing, `exhaustiveness=1-2` and `num_modes=1` are fast but low-confidence.
-
-For results you actually care about, start with:
+The app itself follows the original StrataDock flow:
 
 ```text
-exhaustiveness = 8
-num_modes = 9
-seed = 1
+01. Upload -> 02. Settings -> 03. Run -> 04. Results -> 05. Help
 ```
 
-Then increase exhaustiveness for final checks when runtime allows.
+## Features
 
-### GNINA
+### Docking Engines
 
-GNINA is included in the Linux installer and can run in CPU mode.
+| Engine | Best For | Notes |
+| --- | --- | --- |
+| AutoDock Vina | Reliable CPU-first docking | Default path, works well on Ubuntu/WSL |
+| GNINA CPU | CNN scoring without NVIDIA hardware | Slower, but available on CPU |
+| GNINA CUDA | NVIDIA GPU acceleration | Optional, requires compatible NVIDIA/CUDA setup |
 
-GNINA outputs:
+AMD GPUs are detected and explained, but official GNINA GPU acceleration is CUDA/NVIDIA-based. On AMD machines, use Vina or GNINA CPU mode.
 
-- primary affinity score
-- CNNscore
-- CNNaffinity
+### Binding-Site Modes
 
-GNINA GPU acceleration expects NVIDIA CUDA hardware. AMD GPU machines are detected/explained, but official GNINA GPU acceleration is not treated as supported on AMD. On AMD systems, use AutoDock Vina or GNINA CPU mode.
+| Mode | Use When |
+| --- | --- |
+| Reference ligand | You have a known co-crystal/reference ligand |
+| fpocket | You only have a protein and need predicted pockets |
+| Manual box | You already know center/size coordinates |
 
-## Binding-Site Definition
+fpocket is important for real users who do not have reference ligands. StrataDock can dock across the top predicted pockets instead of pretending pocket 1 is always correct.
 
-Binding-site definition is one of the most important parts of docking.
+### Result Intelligence
 
-### Reference Ligand Mode
+StrataDock does not just dump raw scores. It also:
 
-Use this when you have a co-crystal ligand or known ligand coordinates.
-
-The app builds the docking box around the reference ligand.
-
-This is usually the most reliable mode for validation/redocking.
-
-### fpocket Mode
-
-Use this when the user only has a protein and ligand library, with no known reference ligand.
-
-fpocket predicts geometric pockets from the receptor alone. StrataDock can dock against the top predicted pockets, for example top 3 or top 5.
-
-Important caution:
-
-- fpocket pocket rank is not a guarantee of biological relevance
-- docking every predicted pocket can produce nonsense poses
-- positive Vina scores are possible in bad pockets
-- top 3 is a practical default
-- top 5 is safer for not missing a site but slower and noisier
-
-### Manual Box Mode
-
-Use this when you already know box center and size coordinates.
-
-Manual boxes are useful for reproducing published docking settings or expert-selected binding sites.
-
-## Positive Docking Scores
-
-A positive Vina docking score is not a software crash. It means Vina completed and returned a pose, but the pose is energetically unfavorable.
-
-StrataDock flags these as:
-
-```text
-unfavorable_score
-```
-
-Treat those rows as low-confidence or clashing poses. They should not be interpreted as useful hits.
-
-This matters most when:
-
-- docking into fpocket-predicted pockets
-- using low exhaustiveness
-- using only one output pose
-- docking a ligand against unrelated receptors
-
-For meaningful interpretation, rerun suspicious cases with stronger settings:
-
-```text
-exhaustiveness = 8 or higher
-num_modes = 9
-```
-
-## Receptor Preparation
-
-The receptor preparation pipeline can:
-
-- remove waters
-- remove non-protein hetero atoms
-- keep metals
-- handle alternate locations
-- write cleaned receptor PDB
-- write receptor PDBQT
-- write receptor preparation reports
-
-Outputs include:
-
-- cleaned PDB
-- receptor PDBQT
-- receptor report JSON
-- receptor report TXT
-
-## Ligand Preparation
-
-The ligand preparation pipeline can:
-
-- load ligands from SDF or SMILES-style files
-- handle multi-ligand input
-- embed 3D coordinates when needed
-- prepare PDBQT through Meeko tooling
-- compute ligand descriptors
-- optionally strip salts
-- optionally neutralize
-- optionally set protonation pH when supported by available tools
-
-Ligand preparation outputs include:
-
-- prepared SDF
-- ligand PDBQT
-- descriptor values
-- ADMET-style flags
-
-## ADMET / Pharmacokinetic-Style Output
-
-StrataDock computes lightweight ligand profiling values using RDKit-style descriptors.
-
-Reported fields include:
-
-- molecular weight
-- LogP
-- TPSA
-- hydrogen bond donors
-- hydrogen bond acceptors
-- QED
-- Lipinski failures
-- rotatable bonds
-- heavy atom count
-- aromatic rings
-- formal charge
-- fraction Csp3
-- molar refractivity
-- Rule of Five pass/fail
-- Veber pass/fail
-- BBB penetration estimate
-- hERG risk heuristic
-- hepatotoxicity risk heuristic
-- mutagenicity risk heuristic
-- PAINS alert count
-- Brenk alert count
-- structural alert count
-
-These are screening heuristics, not clinical predictions.
-
-## Output Files
-
-Each run folder may include:
-
-```text
-results.csv
-results.json
-best_by_ligand.csv
-best_by_pocket.csv
-run_summary.txt
-run_manifest.json
-session_manifest.json
-report.html
-report.pdf
-boxes.json
-run_events.jsonl
-```
-
-Per-pose artifacts include:
-
-```text
-*_pose.pdbqt
-*_complex.pdb
-*_interactions.json
-*_interactions.csv
-*_visualize.pml
-*_viewer.html
-```
-
-The app also supports full session ZIP export.
-
-## Result Columns
-
-Important score fields:
-
-- `docking_score`: generic primary score used by the current UI
-- `docking_scores`: all parsed scores/modes
-- `score_type`: `vina_score` or `gnina_affinity`
-- `score_label`: human-readable score label
-- `vina_score`: legacy compatibility column
-- `vina_scores`: legacy compatibility column
-
-For GNINA runs, legacy `vina_score` remains populated for backward compatibility but the correct interpretation is available through `score_type`, `score_label`, and `docking_engine`.
+- ranks poses and ligands
+- flags unfavorable non-negative docking scores
+- flags ADMET-style rule failures
+- summarizes predicted pockets
+- writes reproducible run manifests
+- keeps downloadable artifacts organized by run
 
 ## Validation
 
-StrataDock includes small co-crystal redocking validation cases.
+The repo includes five bundled validation systems:
 
-Run one case:
+| Case | Target |
+| --- | --- |
+| `hiv_protease_1hsg` | HIV protease |
+| `egfr_1m17` | EGFR |
+| `abl_kinase_1iep` | ABL kinase |
+| `trypsin_3ptb` | Trypsin |
+| `hsv_tk_1kim` | HSV thymidine kinase |
+
+Run the full validation suite after setup:
 
 ```bash
-source .venv/bin/activate
-python scripts/validation/run_validation_case.py hiv_protease_1hsg
-```
-
-Run all validation cases:
-
-```bash
-source .venv/bin/activate
 python scripts/validation/run_validation_all.py
-```
-
-Available validation cases:
-
-- `hiv_protease_1hsg`
-- `egfr_1m17`
-- `abl_kinase_1iep`
-- `trypsin_3ptb`
-- `hsv_tk_1kim`
-
-The validation output includes RMSD-style checks where reference native ligands are available.
-
-## Command-Line Usage
-
-Run a single docking job:
-
-```bash
-source .venv/bin/activate
-python scripts/user/run_single.py \
-  --receptor data/validation/hiv_protease_1hsg/receptor.pdb \
-  --ligand data/validation/hiv_protease_1hsg/ligand_input.sdf \
-  --box-from-ligand data/validation/hiv_protease_1hsg/native_ligand.pdb \
-  --out-dir runs/example_single \
-  --exhaustiveness 8 \
-  --num-modes 9
-```
-
-Run a ligand batch:
-
-```bash
-source .venv/bin/activate
-python scripts/user/run_batch.py \
-  --receptor data/validation/hiv_protease_1hsg/receptor.pdb \
-  --ligands data/validation/hiv_protease_1hsg/ligand_input.sdf \
-  --box-from-ligand data/validation/hiv_protease_1hsg/native_ligand.pdb \
-  --out-dir runs/example_batch \
-  --engine vina \
-  --exhaustiveness 8 \
-  --num-modes 9
-```
-
-Run GNINA CPU:
-
-```bash
-source .venv/bin/activate
-python scripts/user/run_batch.py \
-  --receptor data/validation/hiv_protease_1hsg/receptor.pdb \
-  --ligands data/validation/hiv_protease_1hsg/ligand_input.sdf \
-  --box-from-ligand data/validation/hiv_protease_1hsg/native_ligand.pdb \
-  --out-dir runs/example_gnina_cpu \
-  --engine gnina \
-  --gnina-cpu-only \
-  --exhaustiveness 4 \
-  --num-modes 1
-```
-
-Suggest fpocket pockets:
-
-```bash
-source .venv/bin/activate
-python scripts/user/suggest_pockets.py \
-  --receptor data/validation/hiv_protease_1hsg/receptor.pdb \
-  --out-dir runs/pocket_preview \
-  --top-n 5
-```
-
-Inspect receptor prep:
-
-```bash
-source .venv/bin/activate
-python scripts/user/inspect_receptor.py \
-  --receptor data/validation/hiv_protease_1hsg/receptor.pdb \
-  --out-dir runs/receptor_inspection
-```
-
-## Project Layout
-
-```text
-.
-|-- streamlit_app.py
-|-- setup_ubuntu.sh
-|-- run_stratadock.sh
-|-- pyproject.toml
-|-- src/stratadock/
-|   |-- core/
-|   |-- tools/
-|   `-- ui/
-|-- scripts/
-|   |-- install/
-|   |-- user/
-|   `-- validation/
-|-- tests/
-`-- data/validation/
-```
-
-Important modules:
-
-- `src/stratadock/core/batch.py`: batch and ensemble orchestration
-- `src/stratadock/core/docking.py`: Vina/GNINA dispatch
-- `src/stratadock/core/gnina.py`: GNINA command and parser helpers
-- `src/stratadock/core/receptors.py`: receptor preparation
-- `src/stratadock/core/ligands.py`: ligand loading/preparation
-- `src/stratadock/core/pockets.py`: fpocket pocket suggestion
-- `src/stratadock/core/reports.py`: HTML/PDF reports
-- `src/stratadock/ui/tables.py`: result filtering and warning flags
-
-## Development
-
-Create environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip pytest
-python -m pip install -e ".[ui]"
 ```
 
 Run tests:
@@ -528,85 +137,210 @@ Run tests:
 python -m pytest -q
 ```
 
-Run a targeted test file:
+Some integration tests are skipped in a fresh clone until runtime binaries or generated run artifacts exist. `setup_ubuntu.sh` installs/downloads the required docking tools.
+
+## Install Philosophy
+
+The installer is intentionally one command:
 
 ```bash
-python -m pytest tests/test_batch.py -q
+bash setup_ubuntu.sh
 ```
 
-Compile-check edited Python files:
+It creates/repairs `.venv`, installs Python dependencies, prepares fpocket, downloads Vina and GNINA, verifies the environment, and writes the launcher.
 
-```bash
-python -m py_compile streamlit_app.py src/stratadock/core/batch.py
-```
+No manual "go install ten random things" workflow should be needed for normal Ubuntu/WSL use.
 
-## What Is Intentionally Not Included
-
-This repository does not commit:
-
-- `.venv`
-- generated run folders
-- downloaded Vina binaries
-- downloaded GNINA binaries
-- built fpocket source
-- Playwright screenshots/cache
-- local logs
-- generated reports
-
-The installer creates/downloads those locally.
-
-## Notes For Real Use
-
-Docking scores are approximate screening signals. They are not experimental binding affinities.
-
-For better confidence:
-
-- define the binding site carefully
-- prefer reference ligand boxes when available
-- use fpocket top pockets only as a no-reference fallback
-- rerun promising hits with higher exhaustiveness
-- inspect poses visually
-- compare interactions against known biology when possible
-- treat positive docking scores as bad poses
-- validate the installation before trusting new target screens
-
-## Current Limitations
-
-- GNINA GPU acceleration is only treated as supported on NVIDIA CUDA systems.
-- AMD GPU systems use CPU-safe paths.
-- fpocket predictions are geometric suggestions, not biological truth.
-- ADMET outputs are lightweight heuristics.
-- Protein structure prediction / fold-to-dock is intentionally not part of this version.
-- Lead optimization is intentionally not part of this version.
-
-## Useful Troubleshooting
-
-Check environment:
-
-```bash
-source .venv/bin/activate
-python scripts/install/check_environment.py
-```
-
-If port `8502` is busy:
-
-```bash
-lsof -i :8502
-```
-
-or choose a different port.
-
-If Ubuntu package manager is locked, wait. Do not delete dpkg lock files.
-
-If fpocket is missing from apt, setup builds it locally from source.
-
-If GNINA fails on GPU, rerun in CPU mode first.
-
-If docking scores look insane, rerun the same case with:
+## Project Layout
 
 ```text
-exhaustiveness = 8 or 16
-num_modes = 9
+StrataDock/
+  streamlit_app.py              # Streamlit UI
+  setup_ubuntu.sh               # Linux/WSL installer
+  run_stratadock.sh             # generated/usable launcher
+  src/stratadock/core/          # docking, prep, reports, pockets, ADMET
+  src/stratadock/ui/            # UI helpers
+  src/stratadock/tools/         # binary resolution helpers
+  scripts/user/                 # CLI utilities
+  scripts/validation/           # validation runners
+  scripts/install/              # installer helpers
+  data/validation/              # bundled validation cases
+  tests/                        # unit and integration tests
 ```
 
-Then compare whether the top score is stable.
+## Command Line Tools
+
+StrataDock can be used from the UI or from scripts.
+
+```bash
+python scripts/user/run_single.py --help
+python scripts/user/run_batch.py --help
+python scripts/user/suggest_pockets.py --help
+python scripts/user/inspect_receptor.py --help
+python scripts/user/download_pdb.py --help
+```
+
+## Deep Dive
+
+The sections below keep the repo homepage clean while preserving the details needed for real use.
+
+<details>
+<summary><b>Supported inputs</b></summary>
+
+### Receptors
+
+Supported receptor input:
+
+- `.pdb`
+
+### Ligands
+
+Supported ligand input:
+
+- `.sdf`
+- `.smi`
+- `.smiles`
+- `.txt`
+- `.zip` containing supported ligand files
+
+If you have multiple SDF files, put them into a `.zip` and upload the archive.
+
+</details>
+
+<details>
+<summary><b>Docking settings</b></summary>
+
+### Vina settings
+
+Fast smoke-test settings:
+
+```text
+exhaustiveness = 1-2
+num_modes = 1
+```
+
+Reasonable first-pass settings:
+
+```text
+exhaustiveness = 8
+num_modes = 9
+seed = 1
+```
+
+Increase exhaustiveness for slower final checks.
+
+### GNINA settings
+
+GNINA can output:
+
+- affinity score
+- CNNscore
+- CNNaffinity
+
+GNINA CPU mode works without an NVIDIA GPU. GNINA CUDA mode is only for compatible NVIDIA/CUDA systems.
+
+</details>
+
+<details>
+<summary><b>Binding-site guidance</b></summary>
+
+### Reference ligand mode
+
+Use this when you have a co-crystal ligand or known ligand coordinates. This is usually the most reliable validation/redocking mode.
+
+### fpocket mode
+
+Use this when you only have a protein and ligands. StrataDock predicts geometric pockets and can dock across top-ranked pockets.
+
+Practical defaults:
+
+- top 3 pockets for normal screening
+- top 5 pockets when missing the correct site is worse than extra runtime/noise
+
+Important caution:
+
+- fpocket rank is not proof of biological relevance
+- bad pockets can produce poor or positive scores
+- always inspect top-ranked poses visually when results matter
+
+### Manual box mode
+
+Use this when reproducing known docking coordinates or expert-selected binding sites.
+
+</details>
+
+<details>
+<summary><b>Positive docking scores</b></summary>
+
+A positive Vina docking score is not a crash. It means docking completed, but the returned pose is energetically unfavorable.
+
+StrataDock flags these rows as:
+
+```text
+unfavorable_score
+```
+
+Treat positive scores as low-confidence or bad poses unless you have a very specific reason not to.
+
+</details>
+
+<details>
+<summary><b>Outputs</b></summary>
+
+Each run writes a clean run folder with artifacts such as:
+
+- `results.csv`
+- `results.json`
+- `best_by_ligand.csv`
+- `best_by_pocket.csv`
+- `run_summary.txt`
+- `manifest.json`
+- receptor preparation reports
+- prepared ligand files
+- pose PDBQT files
+- complex PDB files
+- interaction CSV/JSON files
+- viewer HTML files
+- PyMOL scripts
+- PDF/HTML reports
+- session ZIP exports
+
+</details>
+
+<details>
+<summary><b>Troubleshooting</b></summary>
+
+### Port 8502 is busy
+
+Run on another port:
+
+```bash
+STRATADOCK_PORT=8503 bash run_stratadock.sh
+```
+
+### apt is locked
+
+Ubuntu may be running unattended upgrades. The installer waits for normal package-manager locks. Do not delete dpkg lock files manually.
+
+### fpocket is not available through apt
+
+That is normal on some Ubuntu installs. The setup script can build/install fpocket instead of relying on the package repository.
+
+### GNINA GPU is not available
+
+GNINA GPU acceleration needs NVIDIA/CUDA. Use GNINA CPU or Vina on CPU-only or AMD systems.
+
+### Fresh clone tests skip integration cases
+
+Some tests require downloaded runtime binaries or generated validation poses. Run setup first:
+
+```bash
+bash setup_ubuntu.sh
+python -m pytest -q
+```
+
+</details>
+
+## Notes
+
+StrataDock is a docking workflow tool, not a biological truth machine. Scores and predicted pockets are screening signals. Important hits should be checked with domain knowledge, visual inspection, repeat docking settings, and stronger downstream validation.
