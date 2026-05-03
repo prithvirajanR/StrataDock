@@ -1,0 +1,31 @@
+[project]
+name = "stratadock"
+version = "1.6.1"
+description = "Clean, modular StrataDock rebuild."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.11",
+  "gemmi>=0.6",
+  "rdkit>=2024.3",
+  "meeko>=0.5",
+]
+
+[project.optional-dependencies]
+docking = [
+  "vina>=1.2",
+]
+test = [
+  "pytest>=8",
+]
+ui = [
+  "streamlit>=1.36",
+]
+prep = [
+  "openmm>=8",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

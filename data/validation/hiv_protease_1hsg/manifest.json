@@ -1,0 +1,32 @@
+{
+  "case_id": "hiv_protease_1hsg",
+  "pdb_id": "1HSG",
+  "description": "HIV-1 protease with MK1 inhibitor; useful compact redocking case.",
+  "source": "https://files.rcsb.org/download/1HSG.pdb",
+  "ligand_sdf_source": "https://models.rcsb.org/v1/1HSG/ligand?auth_asym_id=B&auth_seq_id=902&encoding=sdf",
+  "validation_type": "co_crystal_redocking",
+  "ligand": {
+    "resname": "MK1",
+    "chain": "B",
+    "resseq": "902"
+  },
+  "files": {
+    "complex_pdb": "data/validation/hiv_protease_1hsg/1hsg_complex.pdb",
+    "receptor_pdb": "data/validation/hiv_protease_1hsg/receptor.pdb",
+    "native_ligand_pdb": "data/validation/hiv_protease_1hsg/native_ligand.pdb",
+    "ligand_input_sdf": "data/validation/hiv_protease_1hsg/ligand_input.sdf"
+  },
+  "box": {
+    "center_x": 11.634,
+    "center_y": 22.47,
+    "center_z": 5.859,
+    "size_x": 22.854,
+    "size_y": 18.214,
+    "size_z": 16.635
+  },
+  "acceptance": {
+    "pose_rmsd_angstrom_max": 2.5,
+    "score_must_be_float": true,
+    "pose_file_must_exist": true
+  }
+}

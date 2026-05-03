@@ -1,0 +1,32 @@
+{
+  "case_id": "hsv_tk_1kim",
+  "pdb_id": "1KIM",
+  "description": "HSV thymidine kinase with thymidine; tests nucleoside-like ligand handling.",
+  "source": "https://files.rcsb.org/download/1KIM.pdb",
+  "ligand_sdf_source": "https://models.rcsb.org/v1/1KIM/ligand?auth_asym_id=A&auth_seq_id=1&encoding=sdf",
+  "validation_type": "co_crystal_redocking",
+  "ligand": {
+    "resname": "THM",
+    "chain": "A",
+    "resseq": "1"
+  },
+  "files": {
+    "complex_pdb": "data/validation/hsv_tk_1kim/1kim_complex.pdb",
+    "receptor_pdb": "data/validation/hsv_tk_1kim/receptor.pdb",
+    "native_ligand_pdb": "data/validation/hsv_tk_1kim/native_ligand.pdb",
+    "ligand_input_sdf": "data/validation/hsv_tk_1kim/ligand_input.sdf"
+  },
+  "box": {
+    "center_x": 46.902,
+    "center_y": 83.325,
+    "center_z": 53.874,
+    "size_x": 15.502,
+    "size_y": 12.095,
+    "size_z": 12.464
+  },
+  "acceptance": {
+    "pose_rmsd_angstrom_max": 2.5,
+    "score_must_be_float": true,
+    "pose_file_must_exist": true
+  }
+}

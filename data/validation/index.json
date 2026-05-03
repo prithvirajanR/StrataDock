@@ -1,0 +1,166 @@
+{
+  "source": "RCSB PDB",
+  "purpose": "Small co-crystal redocking validation set for StrataDock v 1.6.01.",
+  "cases": [
+    {
+      "case_id": "hiv_protease_1hsg",
+      "pdb_id": "1HSG",
+      "description": "HIV-1 protease with MK1 inhibitor; useful compact redocking case.",
+      "source": "https://files.rcsb.org/download/1HSG.pdb",
+      "ligand_sdf_source": "https://models.rcsb.org/v1/1HSG/ligand?auth_asym_id=B&auth_seq_id=902&encoding=sdf",
+      "validation_type": "co_crystal_redocking",
+      "ligand": {
+        "resname": "MK1",
+        "chain": "B",
+        "resseq": "902"
+      },
+      "files": {
+        "complex_pdb": "data/validation/hiv_protease_1hsg/1hsg_complex.pdb",
+        "receptor_pdb": "data/validation/hiv_protease_1hsg/receptor.pdb",
+        "native_ligand_pdb": "data/validation/hiv_protease_1hsg/native_ligand.pdb",
+        "ligand_input_sdf": "data/validation/hiv_protease_1hsg/ligand_input.sdf"
+      },
+      "box": {
+        "center_x": 11.634,
+        "center_y": 22.47,
+        "center_z": 5.859,
+        "size_x": 22.854,
+        "size_y": 18.214,
+        "size_z": 16.635
+      },
+      "acceptance": {
+        "pose_rmsd_angstrom_max": 2.5,
+        "score_must_be_float": true,
+        "pose_file_must_exist": true
+      }
+    },
+    {
+      "case_id": "egfr_1m17",
+      "pdb_id": "1M17",
+      "description": "EGFR kinase domain with AQ4 inhibitor; kinase-like validation case.",
+      "source": "https://files.rcsb.org/download/1M17.pdb",
+      "ligand_sdf_source": "https://models.rcsb.org/v1/1M17/ligand?auth_asym_id=A&auth_seq_id=999&encoding=sdf",
+      "validation_type": "co_crystal_redocking",
+      "ligand": {
+        "resname": "AQ4",
+        "chain": "A",
+        "resseq": "999"
+      },
+      "files": {
+        "complex_pdb": "data/validation/egfr_1m17/1m17_complex.pdb",
+        "receptor_pdb": "data/validation/egfr_1m17/receptor.pdb",
+        "native_ligand_pdb": "data/validation/egfr_1m17/native_ligand.pdb",
+        "ligand_input_sdf": "data/validation/egfr_1m17/ligand_input.sdf"
+      },
+      "box": {
+        "center_x": 21.697,
+        "center_y": 0.303,
+        "center_z": 52.093,
+        "size_x": 23.709,
+        "size_y": 12.684,
+        "size_z": 15.099
+      },
+      "acceptance": {
+        "pose_rmsd_angstrom_max": 2.5,
+        "score_must_be_float": true,
+        "pose_file_must_exist": true
+      }
+    },
+    {
+      "case_id": "abl_kinase_1iep",
+      "pdb_id": "1IEP",
+      "description": "ABL kinase with imatinib-like inhibitor; tests larger kinase inhibitor handling.",
+      "source": "https://files.rcsb.org/download/1IEP.pdb",
+      "ligand_sdf_source": "https://models.rcsb.org/v1/1IEP/ligand?auth_asym_id=A&auth_seq_id=201&encoding=sdf",
+      "validation_type": "co_crystal_redocking",
+      "ligand": {
+        "resname": "STI",
+        "chain": "A",
+        "resseq": "201"
+      },
+      "files": {
+        "complex_pdb": "data/validation/abl_kinase_1iep/1iep_complex.pdb",
+        "receptor_pdb": "data/validation/abl_kinase_1iep/receptor.pdb",
+        "native_ligand_pdb": "data/validation/abl_kinase_1iep/native_ligand.pdb",
+        "ligand_input_sdf": "data/validation/abl_kinase_1iep/ligand_input.sdf"
+      },
+      "box": {
+        "center_x": 15.19,
+        "center_y": 53.903,
+        "center_z": 16.917,
+        "size_x": 16.664,
+        "size_y": 24.739,
+        "size_z": 21.526
+      },
+      "acceptance": {
+        "pose_rmsd_angstrom_max": 2.5,
+        "score_must_be_float": true,
+        "pose_file_must_exist": true
+      }
+    },
+    {
+      "case_id": "trypsin_3ptb",
+      "pdb_id": "3PTB",
+      "description": "Trypsin with benzamidine-like ligand; tests small charged ligand handling.",
+      "source": "https://files.rcsb.org/download/3PTB.pdb",
+      "ligand_sdf_source": "https://models.rcsb.org/v1/3PTB/ligand?auth_asym_id=A&auth_seq_id=1&encoding=sdf",
+      "validation_type": "co_crystal_redocking",
+      "ligand": {
+        "resname": "BEN",
+        "chain": "A",
+        "resseq": "1"
+      },
+      "files": {
+        "complex_pdb": "data/validation/trypsin_3ptb/3ptb_complex.pdb",
+        "receptor_pdb": "data/validation/trypsin_3ptb/receptor.pdb",
+        "native_ligand_pdb": "data/validation/trypsin_3ptb/native_ligand.pdb",
+        "ligand_input_sdf": "data/validation/trypsin_3ptb/ligand_input.sdf"
+      },
+      "box": {
+        "center_x": -1.856,
+        "center_y": 14.366,
+        "center_z": 16.748,
+        "size_x": 9.883,
+        "size_y": 11.95,
+        "size_z": 12.514
+      },
+      "acceptance": {
+        "pose_rmsd_angstrom_max": 2.5,
+        "score_must_be_float": true,
+        "pose_file_must_exist": true
+      }
+    },
+    {
+      "case_id": "hsv_tk_1kim",
+      "pdb_id": "1KIM",
+      "description": "HSV thymidine kinase with thymidine; tests nucleoside-like ligand handling.",
+      "source": "https://files.rcsb.org/download/1KIM.pdb",
+      "ligand_sdf_source": "https://models.rcsb.org/v1/1KIM/ligand?auth_asym_id=A&auth_seq_id=1&encoding=sdf",
+      "validation_type": "co_crystal_redocking",
+      "ligand": {
+        "resname": "THM",
+        "chain": "A",
+        "resseq": "1"
+      },
+      "files": {
+        "complex_pdb": "data/validation/hsv_tk_1kim/1kim_complex.pdb",
+        "receptor_pdb": "data/validation/hsv_tk_1kim/receptor.pdb",
+        "native_ligand_pdb": "data/validation/hsv_tk_1kim/native_ligand.pdb",
+        "ligand_input_sdf": "data/validation/hsv_tk_1kim/ligand_input.sdf"
+      },
+      "box": {
+        "center_x": 46.902,
+        "center_y": 83.325,
+        "center_z": 53.874,
+        "size_x": 15.502,
+        "size_y": 12.095,
+        "size_z": 12.464
+      },
+      "acceptance": {
+        "pose_rmsd_angstrom_max": 2.5,
+        "score_must_be_float": true,
+        "pose_file_must_exist": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "case_id": "egfr_1m17",
+  "pdb_id": "1M17",
+  "description": "EGFR kinase domain with AQ4 inhibitor; kinase-like validation case.",
+  "source": "https://files.rcsb.org/download/1M17.pdb",
+  "ligand_sdf_source": "https://models.rcsb.org/v1/1M17/ligand?auth_asym_id=A&auth_seq_id=999&encoding=sdf",
+  "validation_type": "co_crystal_redocking",
+  "ligand": {
+    "resname": "AQ4",
+    "chain": "A",
+    "resseq": "999"
+  },
+  "files": {
+    "complex_pdb": "data/validation/egfr_1m17/1m17_complex.pdb",
+    "receptor_pdb": "data/validation/egfr_1m17/receptor.pdb",
+    "native_ligand_pdb": "data/validation/egfr_1m17/native_ligand.pdb",
+    "ligand_input_sdf": "data/validation/egfr_1m17/ligand_input.sdf"
+  },
+  "box": {
+    "center_x": 21.697,
+    "center_y": 0.303,
+    "center_z": 52.093,
+    "size_x": 23.709,
+    "size_y": 12.684,
+    "size_z": 15.099
+  },
+  "acceptance": {
+    "pose_rmsd_angstrom_max": 2.5,
+    "score_must_be_float": true,
+    "pose_file_must_exist": true
+  }
+}

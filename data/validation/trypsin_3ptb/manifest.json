@@ -1,0 +1,32 @@
+{
+  "case_id": "trypsin_3ptb",
+  "pdb_id": "3PTB",
+  "description": "Trypsin with benzamidine-like ligand; tests small charged ligand handling.",
+  "source": "https://files.rcsb.org/download/3PTB.pdb",
+  "ligand_sdf_source": "https://models.rcsb.org/v1/3PTB/ligand?auth_asym_id=A&auth_seq_id=1&encoding=sdf",
+  "validation_type": "co_crystal_redocking",
+  "ligand": {
+    "resname": "BEN",
+    "chain": "A",
+    "resseq": "1"
+  },
+  "files": {
+    "complex_pdb": "data/validation/trypsin_3ptb/3ptb_complex.pdb",
+    "receptor_pdb": "data/validation/trypsin_3ptb/receptor.pdb",
+    "native_ligand_pdb": "data/validation/trypsin_3ptb/native_ligand.pdb",
+    "ligand_input_sdf": "data/validation/trypsin_3ptb/ligand_input.sdf"
+  },
+  "box": {
+    "center_x": -1.856,
+    "center_y": 14.366,
+    "center_z": 16.748,
+    "size_x": 9.883,
+    "size_y": 11.95,
+    "size_z": 12.514
+  },
+  "acceptance": {
+    "pose_rmsd_angstrom_max": 2.5,
+    "score_must_be_float": true,
+    "pose_file_must_exist": true
+  }
+}

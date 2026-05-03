@@ -1,0 +1,16 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+runs/
+output/
+test-results/
+.playwright-cli/
+.streamlit.pid
+*.log
+tools/bin/
+tools/fpocket_src/
+tools/wsl_debs/
+tools/wsl_fpocket/
+data/validation/**/*_out/

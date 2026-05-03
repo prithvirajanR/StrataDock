@@ -1,0 +1,32 @@
+{
+  "case_id": "abl_kinase_1iep",
+  "pdb_id": "1IEP",
+  "description": "ABL kinase with imatinib-like inhibitor; tests larger kinase inhibitor handling.",
+  "source": "https://files.rcsb.org/download/1IEP.pdb",
+  "ligand_sdf_source": "https://models.rcsb.org/v1/1IEP/ligand?auth_asym_id=A&auth_seq_id=201&encoding=sdf",
+  "validation_type": "co_crystal_redocking",
+  "ligand": {
+    "resname": "STI",
+    "chain": "A",
+    "resseq": "201"
+  },
+  "files": {
+    "complex_pdb": "data/validation/abl_kinase_1iep/1iep_complex.pdb",
+    "receptor_pdb": "data/validation/abl_kinase_1iep/receptor.pdb",
+    "native_ligand_pdb": "data/validation/abl_kinase_1iep/native_ligand.pdb",
+    "ligand_input_sdf": "data/validation/abl_kinase_1iep/ligand_input.sdf"
+  },
+  "box": {
+    "center_x": 15.19,
+    "center_y": 53.903,
+    "center_z": 16.917,
+    "size_x": 16.664,
+    "size_y": 24.739,
+    "size_z": 21.526
+  },
+  "acceptance": {
+    "pose_rmsd_angstrom_max": 2.5,
+    "score_must_be_float": true,
+    "pose_file_must_exist": true
+  }
+}
