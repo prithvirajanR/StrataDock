@@ -122,6 +122,7 @@ def test_upload_page_highlights_esmfold_option():
     assert "ESMFOLD" in source
     assert "Enable ESMFold protein folding" in source
     assert "st.toggle" in source
+    assert "border-left: 3px solid #52d273" not in source
 
 
 def test_zip_run_outputs_contains_files(tmp_path):

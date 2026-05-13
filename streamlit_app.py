@@ -460,33 +460,31 @@ a, a:visited, a:hover {{
     overflow: hidden;
     background: linear-gradient(135deg, rgba(36,36,36,0.98), rgba(22,25,28,0.98));
     border: 1px solid rgba(255,255,255,0.09);
-    border-left: 3px solid #52d273;
-    border-radius: 12px;
-    padding: 1rem 1.05rem;
-    margin: 0.95rem 0 0.55rem;
+    border-radius: 10px;
+    padding: 0.72rem 0.8rem;
+    margin: 0.65rem 0 0.35rem;
     box-shadow: 0 10px 28px rgba(0,0,0,0.30);
 }}
 .fold-feature-card.active {{
     border-color: rgba(82,210,115,0.55);
-    border-left-color: #52d273;
     box-shadow: 0 0 0 1px rgba(82,210,115,0.18), 0 12px 30px rgba(0,0,0,0.34);
 }}
 .fold-feature-top {{
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 0.75rem;
-    margin-bottom: 0.5rem;
+    gap: 0.6rem;
+    margin-bottom: 0.35rem;
 }}
 .fold-feature-title {{
     color: #f4f4f4 !important;
-    font-size: 1.0rem;
+    font-size: 0.9rem;
     font-weight: 850;
     letter-spacing: 0.01em;
 }}
 .fold-badges {{
     display: flex;
-    gap: 0.35rem;
+    gap: 0.3rem;
     flex-wrap: wrap;
     justify-content: flex-end;
 }}
@@ -495,8 +493,8 @@ a, a:visited, a:hover {{
     border: 1px solid rgba(255,255,255,0.12);
     background: rgba(255,255,255,0.06);
     color: #d7d7d7 !important;
-    padding: 0.18rem 0.5rem;
-    font-size: 0.62rem;
+    padding: 0.14rem 0.42rem;
+    font-size: 0.58rem;
     font-weight: 850;
     letter-spacing: 0.07em;
 }}
@@ -507,23 +505,8 @@ a, a:visited, a:hover {{
 }}
 .fold-feature-body {{
     color: #a7a7a7 !important;
-    font-size: 0.82rem;
-    line-height: 1.45;
-    margin-bottom: 0.65rem;
-}}
-.fold-feature-meta {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-}}
-.fold-meta-pill {{
-    color: #dcdcdc !important;
-    background: rgba(255,255,255,0.045);
-    border: 1px solid rgba(255,255,255,0.075);
-    border-radius: 999px;
-    padding: 0.28rem 0.56rem;
-    font-size: 0.70rem;
-    font-weight: 800;
+    font-size: 0.76rem;
+    line-height: 1.35;
 }}
 .admet-strip {{
     display: grid;
@@ -1589,11 +1572,6 @@ def page_upload() -> None:
     </div>
   </div>
   <div class="fold-feature-body">Generate a receptor PDB when the starting point is an amino-acid sequence.</div>
-  <div class="fold-feature-meta">
-    <span class="fold-meta-pill">FASTA / sequence input</span>
-    <span class="fold-meta-pill">Predicted PDB output</span>
-    <span class="fold-meta-pill">Exploratory docking</span>
-  </div>
 </div>
 """,
             unsafe_allow_html=True,
