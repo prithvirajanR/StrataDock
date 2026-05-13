@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from stratadock.core import batch as batch_module
 from stratadock.core.batch import run_batch_screen, run_ensemble_screen
@@ -53,6 +55,13 @@ def _write_zip_ligands(path: Path) -> Path:
     return path
 
 
+def _pdb_line(record: str, serial: int, atom: str, residue: str, chain: str, seq: int, x: float, y: float, z: float, element: str) -> str:
+    return (
+        f"{record:<6}{serial:5d} {atom:^4} {residue:>3} {chain}{seq:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}{1.00:6.2f}{20.00:6.2f}          {element:>2}"
+    )
+
+
 def _install_fast_batch_fakes(monkeypatch):
     state = {"active": 0, "max_active": 0, "vina_calls": 0}
     lock = threading.Lock()
@@ -77,7 +86,11 @@ def _install_fast_batch_fakes(monkeypatch):
             safe_name = f"{safe_name}_{record.source_index}"
         prepared_sdf = output_dir / f"{safe_name}.prepared.sdf"
         pdbqt = output_dir / f"{safe_name}.pdbqt"
-        prepared_sdf.write_text("sdf\n", encoding="utf-8")
+        mol = Chem.Mol(record.mol)
+        AllChem.Compute2DCoords(mol)
+        writer = Chem.SDWriter(str(prepared_sdf))
+        writer.write(mol)
+        writer.close()
         pdbqt.write_text("ligand\n", encoding="utf-8")
         return LigandPrepReport(
             name=safe_name,
@@ -114,7 +127,20 @@ def _install_fast_batch_fakes(monkeypatch):
 
     def fake_complex(*, output_pdb: Path, **_kwargs) -> Path:
         output_pdb.parent.mkdir(parents=True, exist_ok=True)
-        output_pdb.write_text("END\n", encoding="utf-8")
+        output_pdb.write_text(
+            "\n".join(
+                [
+                    _pdb_line("ATOM", 1, "CA", "ALA", "A", 1, 0.0, 0.0, 0.0, "C"),
+                    _pdb_line("ATOM", 2, "CB", "ALA", "A", 1, 1.6, 0.0, 0.0, "C"),
+                    _pdb_line("HETATM", 3, "C1", "LIG", "Z", 1, 2.5, 0.2, 0.0, "C"),
+                    _pdb_line("HETATM", 4, "C2", "LIG", "Z", 1, 3.8, 0.5, 0.2, "C"),
+                    _pdb_line("HETATM", 5, "O1", "LIG", "Z", 1, 4.5, 1.5, 0.4, "O"),
+                    "END",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         return output_pdb
 
     monkeypatch.setattr(batch_module, "prepare_receptor_input", fake_prepare_receptor)
@@ -281,6 +307,12 @@ def test_parallel_batch_accepts_n_jobs_and_matches_sequential_shape(tmp_path, mo
     assert sum(row.prep_status == "load_failed" for row in parallel.results) == 2
     assert sum(row.docking_status == "failed" for row in parallel.results) == 2
     assert state["max_active"] > 1
+    for row in parallel.results:
+        if row.docking_status == "success":
+            assert row.ligand_2d_png and Path(row.ligand_2d_png).exists()
+            assert row.ligand_2d_jpg and Path(row.ligand_2d_jpg).exists()
+            assert row.pose_3d_png and Path(row.pose_3d_png).exists()
+            assert row.pose_3d_jpg and Path(row.pose_3d_jpg).exists()
 
 
 def test_batch_progress_callback_reports_ligand_level_progress(tmp_path, monkeypatch):

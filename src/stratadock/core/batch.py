@@ -25,6 +25,7 @@ from stratadock.core.ligands import (
 )
 from stratadock.core.models import DockingBox, NamedDockingBox
 from stratadock.core.pockets import write_pockets_json
+from stratadock.core.pose_images import write_complex_pose_images, write_ligand_2d_images
 from stratadock.core.reports import write_run_html_report, write_run_pdf_report
 from stratadock.core.receptors import ReceptorPrepReport, prepare_receptor_input
 from stratadock.core.visualization import write_3dmol_viewer_html
@@ -87,6 +88,10 @@ class BatchLigandResult:
     pains_alert_count: int | None
     brenk_alert_count: int | None
     structural_alert_count: int | None
+    ligand_2d_png: str | None = None
+    ligand_2d_jpg: str | None = None
+    pose_3d_png: str | None = None
+    pose_3d_jpg: str | None = None
 
 
 @dataclass(frozen=True)
@@ -969,6 +974,31 @@ def _run_one_ligand(
             **admet,
         )
 
+    ligand_2d_png = ligand_2d_jpg = pose_3d_png = pose_3d_jpg = None
+    image_title = f"{receptor_name} / {named_box.name} / {ligand.name}"
+    try:
+        ligand_images = write_ligand_2d_images(
+            ligand.prepared_sdf,
+            png_path=artifacts_dir / f"{safe_ligand}_ligand_2d.png",
+            jpg_path=artifacts_dir / f"{safe_ligand}_ligand_2d.jpg",
+            title=ligand.name,
+        )
+        ligand_2d_png = str(ligand_images.get("png"))
+        ligand_2d_jpg = str(ligand_images.get("jpg"))
+    except Exception:
+        ligand_2d_png = ligand_2d_jpg = None
+    try:
+        pose_images = write_complex_pose_images(
+            complex_pdb,
+            png_path=artifacts_dir / f"{safe_ligand}_pose_3d.png",
+            jpg_path=artifacts_dir / f"{safe_ligand}_pose_3d.jpg",
+            title=image_title,
+        )
+        pose_3d_png = str(pose_images.get("png"))
+        pose_3d_jpg = str(pose_images.get("jpg"))
+    except Exception:
+        pose_3d_png = pose_3d_jpg = None
+
     return BatchLigandResult(
         receptor_name=receptor_name,
         pocket_name=named_box.name,
@@ -999,6 +1029,10 @@ def _run_one_ligand(
         ligand_salt_stripping_status=ligand.salt_stripping_status,
         ligand_neutralization_status=ligand.neutralization_status,
         error=None,
+        ligand_2d_png=ligand_2d_png,
+        ligand_2d_jpg=ligand_2d_jpg,
+        pose_3d_png=pose_3d_png,
+        pose_3d_jpg=pose_3d_jpg,
         **admet,
     )
 

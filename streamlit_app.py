@@ -1365,6 +1365,10 @@ def result_dataframe(batch_result) -> pd.DataFrame:
         "interactions_json",
         "pymol_script",
         "viewer_html",
+        "ligand_2d_png",
+        "ligand_2d_jpg",
+        "pose_3d_png",
+        "pose_3d_jpg",
         "error",
     ]
     return df[[col for col in columns if col in df.columns]]
@@ -2649,6 +2653,16 @@ def page_results() -> None:
                 pml = Path(row["pymol_script"])
                 if pml.exists():
                     viewer_artifacts.append({"label": "PyMOL Script", "path": pml, "filename": pml.name, "mime": "text/plain"})
+            for label, column, mime in [
+                ("2D Ligand PNG", "ligand_2d_png", "image/png"),
+                ("2D Ligand JPG", "ligand_2d_jpg", "image/jpeg"),
+                ("3D Pose PNG", "pose_3d_png", "image/png"),
+                ("3D Pose JPG", "pose_3d_jpg", "image/jpeg"),
+            ]:
+                if row.get(column):
+                    image_path = Path(str(row[column]))
+                    if image_path.exists():
+                        viewer_artifacts.append({"label": label, "path": image_path, "filename": image_path.name, "mime": mime})
             artifact_download_picker(viewer_artifacts, key_prefix="viewer_downloads")
     with tab_downloads:
         download_grid(st.session_state.last_paths)
@@ -2698,7 +2712,7 @@ For no-reference workflows, top 3 fpocket pockets is the practical default; top 
 - Best summaries: `best_by_ligand.csv`, `best_by_pocket.csv`
 - Complex structures: merged receptor + ligand PDB files
 - Interaction reports: JSON and CSV
-- Visualization: PyMOL script and browser 3Dmol HTML
+- Visualization: browser 3Dmol HTML, PyMOL script, 2D ligand PNG/JPG, and static 3D pose PNG/JPG
 - Reports: HTML and PDF
 - Session archive: full ZIP with `session_manifest.json`
 """

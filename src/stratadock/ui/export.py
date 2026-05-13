@@ -36,6 +36,10 @@ HIT_ARTIFACT_COLUMNS = [
     "pymol_script",
     "prepared_sdf",
     "ligand_pdbqt",
+    "ligand_2d_png",
+    "ligand_2d_jpg",
+    "pose_3d_png",
+    "pose_3d_jpg",
 ]
 
 

@@ -185,6 +185,28 @@ def test_zip_selected_hit_outputs_accepts_absolute_paths_inside_run(tmp_path):
     assert names == {"session_manifest.json", "poses/x_pose.pdbqt"}
 
 
+def test_zip_selected_hit_outputs_collects_pose_image_artifacts(tmp_path):
+    (tmp_path / "artifacts").mkdir()
+    ligand_png = tmp_path / "artifacts" / "x_ligand_2d.png"
+    pose_jpg = tmp_path / "artifacts" / "x_pose_3d.jpg"
+    ligand_png.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+    pose_jpg.write_bytes(b"\xff\xd8\xffimage")
+
+    blob = zip_selected_hit_outputs(
+        tmp_path,
+        [{"ligand_2d_png": str(ligand_png), "pose_3d_jpg": str(pose_jpg)}],
+        include_summary=False,
+    )
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        names = set(archive.namelist())
+
+    assert names == {
+        "session_manifest.json",
+        "artifacts/x_ligand_2d.png",
+        "artifacts/x_pose_3d.jpg",
+    }
+
+
 def test_csv_bytes_exports_selected_rows():
     rows = [
         {"ligand_name": "a", "vina_score": -7.0},

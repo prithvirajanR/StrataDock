@@ -31,6 +31,9 @@ def test_write_3dmol_viewer_html_embeds_pdb(tmp_path):
     assert "container.style.width" in text
     assert "viewerAttempts += 1" in text
     assert "WebGL is disabled or unavailable" in text
+    assert "Download PNG" in text
+    assert "Download JPG" in text
+    assert "downloadViewerImage" in text
     assert "ALA A" in text
     assert "LIG L" in text
 

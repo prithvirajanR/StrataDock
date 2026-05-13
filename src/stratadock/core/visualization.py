@@ -59,17 +59,28 @@ def write_3dmol_viewer_html(
     .interactions {{ margin-top: 10px; max-width: 360px; color: #e8e8e8; font-size: 12px; background: rgba(0,0,0,0.42); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px 10px; }}
     .interactions summary {{ cursor: pointer; }}
     .interactions ul {{ margin: 6px 0 0; padding-left: 18px; max-height: 150px; overflow-y: auto; }}
+    .viewer-actions {{ position: fixed; right: 14px; top: 12px; z-index: 3; display: flex; gap: 8px; align-items: center; }}
+    .viewer-actions button {{ border: 1px solid rgba(255,255,255,0.16); background: rgba(16,16,16,0.78); color: #f2f2f2; border-radius: 7px; padding: 7px 10px; font: 12px Arial, sans-serif; cursor: pointer; }}
+    .viewer-actions button:hover {{ border-color: rgba(255,82,90,0.72); color: #ffffff; }}
+    #download-status {{ color: #b7b7b7; font: 12px Arial, sans-serif; }}
     .viewer-error {{ position: fixed; inset: 0; display: none; place-items: center; color: #f2f2f2; font: 14px Arial, sans-serif; background: #1f1f1f; text-align: center; padding: 24px; }}
   </style>
 </head>
 <body>
   <div class="label">{html.escape(title)}{metadata_rows}{interaction_panel}</div>
+  <div class="viewer-actions">
+    <button type="button" onclick="downloadViewerImage('png')">Download PNG</button>
+    <button type="button" onclick="downloadViewerImage('jpg')">Download JPG</button>
+    <span id="download-status"></span>
+  </div>
   <div id="viewer"></div>
   <div id="viewer-error" class="viewer-error"></div>
   <script>
     const pdbData = {json.dumps(pdb_text)};
     const interactions = {json.dumps(interaction_rows)};
+    const viewerTitle = {json.dumps(title)};
     let viewerAttempts = 0;
+    let activeViewer = null;
 
     function showViewerError(message) {{
       const errorBox = document.getElementById("viewer-error");
@@ -84,6 +95,78 @@ def write_3dmol_viewer_html(
         window.WebGLRenderingContext &&
         (canvas.getContext("webgl") || canvas.getContext("experimental-webgl"))
       );
+    }}
+
+    function safeFileBase() {{
+      return String(viewerTitle || "stratadock_pose")
+        .replace(/[^a-z0-9._-]+/gi, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 90) || "stratadock_pose";
+    }}
+
+    function setDownloadStatus(message) {{
+      const status = document.getElementById("download-status");
+      if (status) status.textContent = message || "";
+    }}
+
+    function saveDataUri(uri, filename) {{
+      const link = document.createElement("a");
+      link.href = uri;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }}
+
+    function pngDataUri() {{
+      if (!activeViewer) {{
+        throw new Error("viewer is not ready yet");
+      }}
+      activeViewer.render();
+      if (typeof activeViewer.pngURI === "function") {{
+        return activeViewer.pngURI();
+      }}
+      const canvas = document.querySelector("#viewer canvas");
+      if (!canvas || typeof canvas.toDataURL !== "function") {{
+        throw new Error("viewer canvas is not available");
+      }}
+      return canvas.toDataURL("image/png");
+    }}
+
+    function convertPngToJpg(pngUri, callback) {{
+      const image = new Image();
+      image.onload = () => {{
+        const canvas = document.createElement("canvas");
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#1f1f1f";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0);
+        callback(canvas.toDataURL("image/jpeg", 0.92));
+      }};
+      image.onerror = () => setDownloadStatus("Image export failed.");
+      image.src = pngUri;
+    }}
+
+    function downloadViewerImage(format) {{
+      try {{
+        setDownloadStatus("Preparing...");
+        const pngUri = pngDataUri();
+        const base = safeFileBase();
+        if (format === "jpg") {{
+          convertPngToJpg(pngUri, (jpgUri) => {{
+            saveDataUri(jpgUri, base + "_3d_view.jpg");
+            setDownloadStatus("");
+          }});
+          return;
+        }}
+        saveDataUri(pngUri, base + "_3d_view.png");
+        setDownloadStatus("");
+      }} catch (error) {{
+        console.error("3D image export failed", error);
+        setDownloadStatus("Image export failed.");
+      }}
     }}
 
     function initializeViewer() {{
@@ -112,6 +195,7 @@ def write_3dmol_viewer_html(
         if (!viewer) {{
           throw new Error("3Dmol returned an empty viewer.");
         }}
+        activeViewer = viewer;
         viewer.addModel(pdbData, "pdb");
         viewer.setStyle({{hetflag: false}}, {receptor_style_js});
         viewer.setStyle({{hetflag: true}}, {ligand_style_js});
