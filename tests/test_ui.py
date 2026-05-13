@@ -105,12 +105,23 @@ def test_persistent_streamlit_checkboxes_use_stable_keys():
         "ligand_neutralize",
         "ligand_use_ph",
         "resume",
+        "show_fold_sequence",
         "viewer_show_interactions",
     ]
 
     for key in stateful_checkbox_keys:
         assert f'key="{key}"' in source
         assert not re.search(rf"st\.session_state\.{key}\s*=\s*[\w.]+\.checkbox\(", source)
+
+
+def test_upload_page_highlights_esmfold_option():
+    source = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
+
+    assert "fold-feature-card" in source
+    assert "AI STRUCTURE" in source
+    assert "ESMFOLD" in source
+    assert "Enable ESMFold protein folding" in source
+    assert "st.toggle" in source
 
 
 def test_zip_run_outputs_contains_files(tmp_path):
