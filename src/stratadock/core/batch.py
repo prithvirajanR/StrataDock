@@ -993,6 +993,8 @@ def _run_one_ligand(
             png_path=artifacts_dir / f"{safe_ligand}_pose_3d.png",
             jpg_path=artifacts_dir / f"{safe_ligand}_pose_3d.jpg",
             title=image_title,
+            interactions=interactions,
+            score=docked.score,
         )
         pose_3d_png = str(pose_images.get("png"))
         pose_3d_jpg = str(pose_images.get("jpg"))

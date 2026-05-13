@@ -3,7 +3,13 @@ from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from stratadock.core.pose_images import write_complex_pose_images, write_ligand_2d_images
+from stratadock.core.pdb import parse_pdb_atoms
+from stratadock.core.pose_images import (
+    summarize_nearby_residues,
+    summarize_pose_contacts,
+    write_complex_pose_images,
+    write_ligand_2d_images,
+)
 
 
 def _write_ethanol_sdf(path: Path) -> Path:
@@ -71,3 +77,77 @@ def test_write_complex_pose_images_creates_static_3d_png_and_jpg(tmp_path):
     assert images["jpg"].read_bytes().startswith(b"\xff\xd8\xff")
     assert images["png"].stat().st_size > 1000
     assert images["jpg"].stat().st_size > 1000
+
+
+def test_pose_image_accepts_interactions_and_summarizes_contact_labels(tmp_path):
+    complex_pdb = tmp_path / "complex.pdb"
+    complex_pdb.write_text(
+        "\n".join(
+            [
+                _pdb_line("ATOM", 1, "O", "SER", "A", 42, 0.0, 0.0, 0.0, "O"),
+                _pdb_line("ATOM", 2, "CB", "PHE", "A", 99, 0.4, 1.1, 0.0, "C"),
+                _pdb_line("HETATM", 3, "C1", "LIG", "Z", 1, 2.0, 0.0, 0.0, "C"),
+                _pdb_line("HETATM", 4, "O1", "LIG", "Z", 1, 2.8, 0.4, 0.0, "O"),
+                "END",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    interactions = [
+        {
+            "interaction_type": "polar_contact",
+            "residue_name": "SER",
+            "chain_id": "A",
+            "residue_seq": "42",
+            "receptor_atom": "O",
+            "ligand_atom_index": 1,
+            "ligand_element": "O",
+            "distance_angstrom": 2.7,
+        },
+        {
+            "interaction_type": "hydrophobic",
+            "residue_name": "PHE",
+            "chain_id": "A",
+            "residue_seq": "99",
+            "receptor_atom": "CB",
+            "ligand_atom_index": 0,
+            "ligand_element": "C",
+            "distance_angstrom": 3.8,
+        },
+    ]
+
+    contacts = summarize_pose_contacts(interactions)
+    images = write_complex_pose_images(
+        complex_pdb,
+        png_path=tmp_path / "pose_contacts.png",
+        jpg_path=tmp_path / "pose_contacts.jpg",
+        title="annotated pose",
+        interactions=interactions,
+        score=-5.644,
+    )
+
+    assert [contact.residue_label for contact in contacts] == ["SER A42", "PHE A99"]
+    assert contacts[0].label == "Polar contact | O1 -> SER A42 O | 2.70 A"
+    assert images["png"].read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert images["jpg"].read_bytes().startswith(b"\xff\xd8\xff")
+
+
+def test_nearby_residue_summary_reports_closest_binding_site_residues():
+    pdb_text = "\n".join(
+        [
+            _pdb_line("ATOM", 1, "O", "SER", "A", 42, 0.0, 0.0, 0.0, "O"),
+            _pdb_line("ATOM", 2, "CB", "PHE", "A", 99, 0.0, 3.0, 0.0, "C"),
+            _pdb_line("HETATM", 3, "C1", "LIG", "Z", 1, 2.0, 0.0, 0.0, "C"),
+            _pdb_line("HETATM", 4, "O1", "LIG", "Z", 1, 2.8, 0.4, 0.0, "O"),
+        ]
+    )
+    atoms = parse_pdb_atoms(pdb_text)
+    receptor_atoms = [atom for atom in atoms if atom.record == "ATOM"]
+    ligand_atoms = [atom for atom in atoms if atom.record == "HETATM"]
+
+    residues = summarize_nearby_residues(receptor_atoms, ligand_atoms)
+
+    assert [residue.residue_label for residue in residues] == ["SER A42", "PHE A99"]
+    assert residues[0].closest_atom == "O"
+    assert residues[0].distance_angstrom == 2.0
