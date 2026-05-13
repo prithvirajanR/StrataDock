@@ -91,6 +91,33 @@ def test_clean_receptor_can_keep_or_remove_metals(tmp_path):
     assert removed_report.metals_removed == 1
 
 
+def test_clean_receptor_does_not_keep_ligand_halogen_as_simple_ion(tmp_path):
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text(
+        "\n".join(
+            [
+                _pdb_line("ATOM", 1, "N", "ALA", "A", 1, "N"),
+                _pdb_line("ATOM", 2, "CA", "ALA", "A", 1, "C"),
+                _pdb_line("HETATM", 3, "NA", "NA", "A", 2, "NA"),
+                _pdb_line("HETATM", 4, "C1", "LIG", "A", 3, "C"),
+                _pdb_line("HETATM", 5, "CL1", "LIG", "A", 3, "CL"),
+                "END",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = clean_receptor_pdb(receptor, tmp_path / "cleaned.pdb")
+    atoms = parse_pdb_atoms((tmp_path / "cleaned.pdb").read_text())
+
+    assert any(atom.residue_name == "NA" for atom in atoms)
+    assert all(atom.residue_name != "LIG" for atom in atoms)
+    assert report.metals_kept == 1
+    assert report.hetero_removed == 2
+    assert report.kept_metal_residue_counts == {"NA": 1}
+
+
 def test_clean_receptor_uses_requested_default_altloc(tmp_path):
     receptor = tmp_path / "altloc.pdb"
     receptor.write_text(
@@ -177,3 +204,41 @@ def test_receptor_report_json_reflects_prep_options_and_counts(tmp_path, monkeyp
     assert data["metals_kept"] == 0
     assert data["metals_removed"] == 1
     assert data["kept_hetero_residue_counts"] == {"FAD": 1}
+
+
+def test_prepare_receptor_retries_without_metals_when_pdbqt_writer_cannot_type_them(tmp_path, monkeypatch):
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text(
+        "\n".join(
+            [
+                _pdb_line("ATOM", 1, "N", "ALA", "A", 1, "N"),
+                _pdb_line("ATOM", 2, "CA", "ALA", "A", 1, "C"),
+                _pdb_line("HETATM", 3, "NA", "NA", "A", 2, "NA"),
+                "END",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_prepare_receptor_pdbqt(input_pdb, output_pdbqt):
+        calls.append(input_pdb)
+        text = input_pdb.read_text(encoding="utf-8")
+        if "HETATM" in text:
+            raise RuntimeError("synthetic ion typing failure")
+        output_pdbqt.write_text("REMARK fake pdbqt\n", encoding="utf-8")
+        return output_pdbqt
+
+    monkeypatch.setattr(
+        "stratadock.core.receptors.prepare_receptor_pdbqt",
+        fake_prepare_receptor_pdbqt,
+    )
+
+    report = prepare_receptor_input(receptor, tmp_path / "out", keep_metals=True)
+
+    assert len(calls) == 2
+    assert report.pdbqt.exists()
+    assert report.clean_report.metals_removed == 1
+    assert "remove_metals_for_pdbqt_fallback" in report.prep_steps
+    assert any("removed automatically" in warning for warning in report.clean_report.warnings)

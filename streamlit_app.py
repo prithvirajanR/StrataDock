@@ -7,6 +7,7 @@ import shutil
 import sys
 from dataclasses import asdict
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -1319,7 +1320,19 @@ def result_dataframe(batch_result) -> pd.DataFrame:
 def load_last_df() -> pd.DataFrame:
     if "last_table" not in st.session_state:
         return pd.DataFrame()
-    return pd.read_json(st.session_state.last_table, orient="records")
+    return read_results_table(st.session_state.last_table)
+
+
+def read_results_table(table_payload: object) -> pd.DataFrame:
+    if table_payload is None:
+        return pd.DataFrame()
+    if isinstance(table_payload, bytes):
+        table_payload = table_payload.decode("utf-8")
+    if isinstance(table_payload, str):
+        stripped = table_payload.lstrip()
+        if stripped.startswith("[") or stripped.startswith("{"):
+            return pd.read_json(StringIO(table_payload), orient="records")
+    return pd.read_json(table_payload, orient="records")
 
 
 def active_run_control_file() -> Path:

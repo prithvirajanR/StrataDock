@@ -4,7 +4,7 @@ import json
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from stratadock.tools.binaries import script_binary
@@ -250,6 +250,12 @@ def clean_receptor_pdb(
     default_altloc: str = "A",
 ) -> ReceptorCleanReport:
     output_pdb.parent.mkdir(parents=True, exist_ok=True)
+    lines = input_pdb.read_text(encoding="utf-8", errors="ignore").splitlines()
+    hetatm_residue_atom_counts = Counter(
+        _residue_id(line)
+        for line in lines
+        if line.startswith("HETATM")
+    )
     kept: list[str] = []
     atoms_kept = waters_removed = waters_kept = hetero_removed = hetero_kept = 0
     metals_kept = metals_removed = altlocs_normalized = altlocs_dropped = 0
@@ -264,7 +270,7 @@ def clean_receptor_pdb(
     kept_metal_residue_counts: Counter[str] = Counter()
     removed_metal_residue_counts: Counter[str] = Counter()
 
-    for line in input_pdb.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for line in lines:
         if not line.startswith(("ATOM", "HETATM")):
             continue
         residue = line[17:20].strip().upper()
@@ -299,7 +305,7 @@ def clean_receptor_pdb(
             waters_kept += 1
             continue
         if line.startswith("HETATM"):
-            is_metal = residue in METAL_NAMES or element in METAL_NAMES or atom_name in METAL_NAMES
+            is_metal = residue in METAL_NAMES and hetatm_residue_atom_counts[residue_id] == 1
             if is_metal:
                 if keep_metals:
                     kept.append(line)
@@ -492,7 +498,30 @@ def prepare_receptor_input(
     if minimize_with_openmm_enabled:
         working_pdb = minimize_with_openmm(working_pdb, output_dir / f"{input_pdb.stem}.minimized.pdb")
         prep_steps.append("openmm_minimize")
-    pdbqt = prepare_receptor_pdbqt(working_pdb, output_dir / f"{input_pdb.stem}.pdbqt")
+    try:
+        pdbqt = prepare_receptor_pdbqt(working_pdb, output_dir / f"{input_pdb.stem}.pdbqt")
+    except RuntimeError:
+        if not keep_metals or clean_report.metals_kept == 0:
+            raise
+        fallback_pdb = output_dir / f"{input_pdb.stem}.no_metals_for_pdbqt.pdb"
+        fallback_report = clean_receptor_pdb(
+            working_pdb,
+            fallback_pdb,
+            remove_waters=False,
+            remove_non_protein_heteroatoms=True,
+            keep_metals=False,
+            default_altloc=default_altloc,
+        )
+        clean_report = replace(
+            fallback_report,
+            warnings=(
+                *fallback_report.warnings,
+                "Metal/ion records were removed automatically because receptor PDBQT preparation could not type them.",
+            ),
+        )
+        working_pdb = fallback_pdb
+        prep_steps.append("remove_metals_for_pdbqt_fallback")
+        pdbqt = prepare_receptor_pdbqt(working_pdb, output_dir / f"{input_pdb.stem}.pdbqt")
     report_json, report_txt = write_receptor_reports(
         clean_report,
         options=options,

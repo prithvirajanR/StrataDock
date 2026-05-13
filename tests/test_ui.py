@@ -18,6 +18,18 @@ def test_streamlit_app_compiles():
     assert spec.loader is not None
 
 
+def test_read_results_table_accepts_json_string():
+    spec = importlib.util.spec_from_file_location("stratadock_streamlit_app", ROOT / "streamlit_app.py")
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    df = module.read_results_table('[{"ligand_name":"x","vina_score":-7.1}]')
+
+    assert df.to_dict(orient="records") == [{"ligand_name": "x", "vina_score": -7.1}]
+
+
 def test_persistent_streamlit_checkboxes_use_stable_keys():
     source = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
     stateful_checkbox_keys = [
