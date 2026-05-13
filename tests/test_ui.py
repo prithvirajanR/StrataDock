@@ -12,6 +12,33 @@ from stratadock.ui.state import normalize_uploaded_ligands, normalize_uploaded_r
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class AttrDict(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def _load_streamlit_module():
+    spec = importlib.util.spec_from_file_location("stratadock_streamlit_app", ROOT / "streamlit_app.py")
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _pdb_line(record: str, serial: int, atom: str, residue: str, chain: str, seq: int, x: float, element: str) -> str:
+    return (
+        f"{record:<6}{serial:5d} {atom:^4} {residue:>3} {chain}{seq:4d}    "
+        f"{x:8.3f}{0.0:8.3f}{0.0:8.3f}{1.00:6.2f}{20.00:6.2f}          {element:>2}"
+    )
+
+
 def test_streamlit_app_compiles():
     spec = importlib.util.spec_from_file_location("stratadock_streamlit_app", ROOT / "streamlit_app.py")
     assert spec is not None
@@ -19,15 +46,49 @@ def test_streamlit_app_compiles():
 
 
 def test_read_results_table_accepts_json_string():
-    spec = importlib.util.spec_from_file_location("stratadock_streamlit_app", ROOT / "streamlit_app.py")
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _load_streamlit_module()
 
     df = module.read_results_table('[{"ligand_name":"x","vina_score":-7.1}]')
 
     assert df.to_dict(orient="records") == [{"ligand_name": "x", "vina_score": -7.1}]
+
+
+def test_write_upload_bytes_extracts_detected_receptor_reference_ligand(tmp_path, monkeypatch):
+    module = _load_streamlit_module()
+    pdb_text = "\n".join(
+        [
+            _pdb_line("ATOM", 1, "N", "ALA", "A", 1, 0.0, "N"),
+            _pdb_line("HETATM", 2, "NA", "NA", "A", 10, 1.0, "NA"),
+            _pdb_line("HETATM", 3, "C1", "LIG", "A", 12, 3.0, "C"),
+            _pdb_line("HETATM", 4, "C2", "LIG", "A", 12, 4.0, "C"),
+            _pdb_line("HETATM", 5, "C3", "LIG", "A", 12, 5.0, "C"),
+            _pdb_line("HETATM", 6, "C4", "LIG", "A", 12, 6.0, "C"),
+            _pdb_line("HETATM", 7, "C5", "LIG", "A", 12, 7.0, "C"),
+            _pdb_line("HETATM", 8, "CL1", "LIG", "A", 12, 8.0, "CL"),
+            "END",
+        ]
+    )
+    state = AttrDict(
+        receptor_uploads=[{"name": "complex.pdb", "bytes": pdb_text.encode("utf-8")}],
+        receptor_name="complex.pdb",
+        receptor_bytes=pdb_text.encode("utf-8"),
+        ligand_name="ligands.smi",
+        ligand_bytes=b"CCO ethanol\n",
+        reference_source="Use ligand detected in receptor",
+        reference_receptor_name="complex.pdb",
+        reference_ligand_selector="LIG:A:12",
+        reference_name=None,
+        reference_bytes=None,
+    )
+    monkeypatch.setattr(module.st, "session_state", state)
+
+    _receptors, _ligand, reference = module.write_upload_bytes(tmp_path)
+
+    assert reference is not None
+    text = reference.read_text(encoding="utf-8")
+    assert "LIG" in text
+    assert "ALA" not in text
+    assert " NA " not in text
 
 
 def test_persistent_streamlit_checkboxes_use_stable_keys():

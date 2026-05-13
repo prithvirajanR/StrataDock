@@ -27,6 +27,7 @@ from stratadock.core.hardware import detect_hardware
 from stratadock.core.history import import_session_zip, list_run_history, load_run
 from stratadock.core.ligands import LigandPrepOptions, load_ligand_records_with_errors
 from stratadock.core.models import NamedDockingBox
+from stratadock.core.pdb import extract_ligand_pdb, ligand_candidates_from_pdb, parse_ligand_selector
 from stratadock.core.pdb_download import download_pdb
 from stratadock.core.pockets import suggest_pockets_with_fpocket
 from stratadock.core.reports import write_run_pdf_report
@@ -70,6 +71,9 @@ def init_state() -> None:
         "ligand_bytes": None,
         "reference_name": None,
         "reference_bytes": None,
+        "reference_source": "Upload separate reference file",
+        "reference_receptor_name": None,
+        "reference_ligand_selector": None,
         "pdb_id_input": "",
         "fold_sequence": "",
         "fold_allow_network": False,
@@ -1147,6 +1151,39 @@ def set_ligand_uploads(uploads) -> None:
             st.session_state.ligand_bytes = normalized["bytes"]
 
 
+def receptor_ligand_candidates() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    receptors = list(st.session_state.get("receptor_uploads") or [])
+    if not receptors and st.session_state.receptor_name and st.session_state.receptor_bytes:
+        receptors = [{"name": st.session_state.receptor_name, "bytes": st.session_state.receptor_bytes}]
+    for receptor_index, receptor in enumerate(receptors):
+        try:
+            text = bytes(receptor["bytes"]).decode("utf-8", errors="ignore")
+            candidates = ligand_candidates_from_pdb(text)
+        except Exception:
+            candidates = []
+        for candidate in candidates:
+            rows.append(
+                {
+                    "receptor_index": receptor_index,
+                    "receptor_name": receptor["name"],
+                    "selector": candidate.selector,
+                    "label": f"{receptor['name']} / {candidate.label}",
+                    "residue_name": candidate.residue_name,
+                    "chain_id": candidate.chain_id or "_",
+                    "residue_seq": candidate.residue_seq,
+                    "atom_count": candidate.atom_count,
+                }
+            )
+    return rows
+
+
+def _safe_reference_name(receptor_name: str, selector: str) -> str:
+    stem = Path(receptor_name).stem or "receptor"
+    safe_selector = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in selector)
+    return f"{stem}_{safe_selector}_reference_ligand.pdb"
+
+
 def write_upload_bytes(run_dir: Path) -> tuple[list[Path], Path, Path | None]:
     input_dir = run_dir / "inputs"
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -1161,7 +1198,23 @@ def write_upload_bytes(run_dir: Path) -> tuple[list[Path], Path, Path | None]:
     ligand_path = input_dir / st.session_state.ligand_name
     ligand_path.write_bytes(st.session_state.ligand_bytes)
     reference_path = None
-    if st.session_state.reference_bytes and st.session_state.reference_name:
+    if st.session_state.reference_source == "Use ligand detected in receptor":
+        selector = st.session_state.reference_ligand_selector
+        receptor_name = st.session_state.reference_receptor_name
+        if selector and receptor_name:
+            matching_receptor = next(
+                (path for path in receptor_paths if path.name == receptor_name or path.name.endswith(f"_{receptor_name}")),
+                None,
+            )
+            if matching_receptor is None:
+                raise ValueError("Selected receptor ligand is no longer available. Re-select the reference ligand.")
+            ligand_text = extract_ligand_pdb(
+                matching_receptor.read_text(encoding="utf-8", errors="ignore"),
+                parse_ligand_selector(str(selector)),
+            )
+            reference_path = input_dir / _safe_reference_name(receptor_name, str(selector))
+            reference_path.write_text(ligand_text, encoding="utf-8")
+    elif st.session_state.reference_bytes and st.session_state.reference_name:
         reference_path = input_dir / st.session_state.reference_name
         reference_path.write_bytes(st.session_state.reference_bytes)
     return receptor_paths, ligand_path, reference_path
@@ -1171,7 +1224,7 @@ def selected_boxes(run_dir: Path, receptor_path: Path, reference_path: Path | No
     mode = st.session_state.box_mode
     if mode == "Reference ligand PDB":
         if reference_path is None:
-            raise ValueError("Upload a reference/native ligand PDB or choose another box source.")
+            raise ValueError("Upload a reference/native ligand or select a detected receptor ligand.")
         return [
             NamedDockingBox(
                 name="reference_ligand",
@@ -1623,9 +1676,40 @@ def page_settings() -> None:
             horizontal=True,
         )
         if st.session_state.box_mode == "Reference ligand PDB":
-            reference_upload = st.file_uploader("Reference/native ligand", type=["pdb", "sdf", "mol", "mol2"], key="reference_upload")
-            set_upload_state(reference_upload, "reference_name", "reference_bytes")
-            st.caption(st.session_state.reference_name or "Upload a co-crystallized ligand as PDB, SDF, MOL, or MOL2.")
+            candidates = receptor_ligand_candidates()
+            source_options = ["Upload separate reference file"]
+            if candidates:
+                source_options.insert(0, "Use ligand detected in receptor")
+            if st.session_state.reference_source not in source_options:
+                st.session_state.reference_source = source_options[0]
+            st.session_state.reference_source = st.radio(
+                "Reference source",
+                source_options,
+                index=source_options.index(st.session_state.reference_source),
+                horizontal=True,
+            )
+            if st.session_state.reference_source == "Use ligand detected in receptor":
+                labels = [str(row["label"]) for row in candidates]
+                current_index = next(
+                    (
+                        idx
+                        for idx, row in enumerate(candidates)
+                        if row["receptor_name"] == st.session_state.reference_receptor_name
+                        and row["selector"] == st.session_state.reference_ligand_selector
+                    ),
+                    0,
+                )
+                selected_idx = st.selectbox("Detected receptor ligand", list(range(len(candidates))), index=current_index, format_func=lambda idx: labels[idx])
+                selected = candidates[int(selected_idx)]
+                st.session_state.reference_receptor_name = str(selected["receptor_name"])
+                st.session_state.reference_ligand_selector = str(selected["selector"])
+                st.caption("This ligand is used only to define the docking box; receptor prep still removes bound ligands before docking.")
+                if len(st.session_state.get("receptor_uploads") or []) > 1:
+                    st.warning("The selected reference ligand box is applied to all uploaded receptors.")
+            else:
+                reference_upload = st.file_uploader("Reference/native ligand", type=["pdb", "sdf", "mol", "mol2"], key="reference_upload")
+                set_upload_state(reference_upload, "reference_name", "reference_bytes")
+                st.caption(st.session_state.reference_name or "Upload a co-crystallized ligand as PDB, SDF, MOL, or MOL2.")
         elif st.session_state.box_mode == "Suggest pockets (fpocket)":
             c1, c2 = st.columns([1, 1])
             st.session_state.top_pockets = c1.slider("Top fpocket pockets to dock", 1, 10, int(st.session_state.top_pockets))
